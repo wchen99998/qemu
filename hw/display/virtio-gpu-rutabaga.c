@@ -7,8 +7,10 @@
 #include "trace.h"
 #include "hw/virtio/virtio.h"
 #include "hw/virtio/virtio-gpu.h"
+#include "hw/virtio/virtio-gpu-bswap.h"
 #include "hw/virtio/virtio-gpu-pixman.h"
 #include "hw/virtio/virtio-iommu.h"
+#include "ui/rect.h"
 
 #include <glib/gmem.h>
 #include <rutabaga_gfx/rutabaga_gfx_ffi.h>
@@ -125,6 +127,7 @@ rutabaga_cmd_create_resource_2d(VirtIOGPU *g,
     CHECK(!result, cmd);
 
     res = g_new0(struct virtio_gpu_simple_resource, 1);
+    res->dmabuf_fd = -1;
     res->width = c2d.width;
     res->height = c2d.height;
     res->format = c2d.format;
@@ -164,6 +167,7 @@ rutabaga_cmd_create_resource_3d(VirtIOGPU *g,
     CHECK(!result, cmd);
 
     res = g_new0(struct virtio_gpu_simple_resource, 1);
+    res->dmabuf_fd = -1;
     res->width = c3d.width;
     res->height = c3d.height;
     res->format = c3d.format;
@@ -177,14 +181,24 @@ virtio_gpu_rutabaga_resource_unref(VirtIOGPU *g,
                                    struct virtio_gpu_simple_resource *res,
                                    Error **errp)
 {
+    int i;
     VirtIOGPUBase *vb = VIRTIO_GPU_BASE(g);
     int32_t result;
     Error *local_err = NULL;
     VirtIOGPURutabaga *vr = VIRTIO_GPU_RUTABAGA(g);
     int slot = rutabaga_find_mapping_slot(vr, res->resource_id);
 
+    if (res->scanout_bitmask) {
+        for (i = 0; i < g->parent_obj.conf.max_outputs; i++) {
+            if (res->scanout_bitmask & (1 << i)) {
+                virtio_gpu_disable_scanout(g, i);
+            }
+        }
+    }
+
     if (slot >= 0) {
         rutabaga_release_mapping_slot(vb, vr, slot);
+        res->blob = NULL;
 
         result = rutabaga_resource_unmap(vr->rutabaga, res->resource_id);
         if (result) {
@@ -211,6 +225,7 @@ virtio_gpu_rutabaga_resource_unref(VirtIOGPU *g,
         pixman_image_unref(res->image);
     }
 
+    virtio_gpu_cleanup_mapping(g, res);
     QTAILQ_REMOVE(&g->reslist, res, next);
     g_free(res);
 
@@ -286,7 +301,9 @@ rutabaga_cmd_resource_flush(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd)
     struct rutabaga_transfer transfer = { 0 };
     struct iovec transfer_iovec;
     struct virtio_gpu_resource_flush rf;
-    bool found = false;
+    QemuRect flush_rect;
+    bool within_bounds = false;
+    bool update_submitted = false;
 
     VirtIOGPUBase *vb = VIRTIO_GPU_BASE(g);
     VirtIOGPURutabaga *vr = VIRTIO_GPU_RUTABAGA(g);
@@ -301,39 +318,85 @@ rutabaga_cmd_resource_flush(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd)
     res = virtio_gpu_find_resource(g, rf.resource_id);
     CHECK(res, cmd);
 
+    if (res->blob) {
+        for (i = 0; i < vb->conf.max_outputs; i++) {
+            scanout = &vb->scanout[i];
+            if (scanout->resource_id == res->resource_id &&
+                rf.r.x < scanout->x + scanout->width &&
+                rf.r.x + rf.r.width >= scanout->x &&
+                rf.r.y < scanout->y + scanout->height &&
+                rf.r.y + rf.r.height >= scanout->y) {
+                within_bounds = true;
+
+                if (console_has_gl(scanout->con)) {
+                    dpy_gl_update(scanout->con, 0, 0, scanout->width,
+                                  scanout->height);
+                    update_submitted = true;
+                }
+            }
+        }
+
+        if (update_submitted) {
+            return;
+        }
+
+        if (!within_bounds) {
+            cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+            return;
+        }
+    } else {
+        for (i = 0; i < vb->conf.max_outputs; i++) {
+            if (res->scanout_bitmask & (1 << i)) {
+                within_bounds = true;
+                break;
+            }
+        }
+
+        if (!within_bounds) {
+            return;
+        }
+
+        transfer.x = 0;
+        transfer.y = 0;
+        transfer.z = 0;
+        transfer.w = res->width;
+        transfer.h = res->height;
+        transfer.d = 1;
+
+        transfer_iovec.iov_base = pixman_image_get_data(res->image);
+        transfer_iovec.iov_len = pixman_image_get_stride(res->image) *
+                                 res->height;
+
+        result = rutabaga_resource_transfer_read(vr->rutabaga, 0,
+                                                 rf.resource_id, &transfer,
+                                                 &transfer_iovec);
+        CHECK(!result, cmd);
+    }
+
+    qemu_rect_init(&flush_rect, rf.r.x, rf.r.y, rf.r.width, rf.r.height);
     for (i = 0; i < vb->conf.max_outputs; i++) {
+        QemuRect rect;
+
+        if (!(res->scanout_bitmask & (1 << i))) {
+            continue;
+        }
+
         scanout = &vb->scanout[i];
-        if (i == res->scanout_bitmask) {
-            found = true;
-            break;
+        qemu_rect_init(&rect, scanout->x, scanout->y,
+                       scanout->width, scanout->height);
+        if (qemu_rect_intersect(&flush_rect, &rect, &rect)) {
+            qemu_rect_translate(&rect, -scanout->x, -scanout->y);
+            dpy_gfx_update(scanout->con,
+                           rect.x, rect.y, rect.width, rect.height);
         }
     }
-
-    if (!found) {
-        return;
-    }
-
-    transfer.x = 0;
-    transfer.y = 0;
-    transfer.z = 0;
-    transfer.w = res->width;
-    transfer.h = res->height;
-    transfer.d = 1;
-
-    transfer_iovec.iov_base = pixman_image_get_data(res->image);
-    transfer_iovec.iov_len = res->width * res->height * 4;
-
-    result = rutabaga_resource_transfer_read(vr->rutabaga, 0,
-                                             rf.resource_id, &transfer,
-                                             &transfer_iovec);
-    CHECK(!result, cmd);
-    dpy_gfx_update_full(scanout->con);
 }
 
 static void
 rutabaga_cmd_set_scanout(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd)
 {
     struct virtio_gpu_simple_resource *res;
+    struct virtio_gpu_framebuffer fb = { 0 };
     struct virtio_gpu_scanout *scanout = NULL;
     struct virtio_gpu_set_scanout ss;
 
@@ -347,12 +410,14 @@ rutabaga_cmd_set_scanout(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd)
     trace_virtio_gpu_cmd_set_scanout(ss.scanout_id, ss.resource_id,
                                      ss.r.width, ss.r.height, ss.r.x, ss.r.y);
 
-    CHECK(ss.scanout_id < VIRTIO_GPU_MAX_SCANOUTS, cmd);
+    if (ss.scanout_id >= g->parent_obj.conf.max_outputs) {
+        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID;
+        return;
+    }
     scanout = &vb->scanout[ss.scanout_id];
 
     if (ss.resource_id == 0) {
-        dpy_gfx_replace_surface(scanout->con, NULL);
-        dpy_gl_scanout_disable(scanout->con);
+        virtio_gpu_disable_scanout(g, ss.scanout_id);
         return;
     }
 
@@ -376,9 +441,76 @@ rutabaga_cmd_set_scanout(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd)
 
     /* realloc the surface ptr */
     scanout->ds = qemu_create_displaysurface_pixman(res->image);
+    fb.format = pixman_image_get_format(res->image);
+    fb.bytes_pp = DIV_ROUND_UP(PIXMAN_FORMAT_BPP(fb.format), 8);
+    fb.width = pixman_image_get_width(res->image);
+    fb.height = pixman_image_get_height(res->image);
+    fb.stride = pixman_image_get_stride(res->image);
+    fb.offset = ss.r.x * fb.bytes_pp + ss.r.y * fb.stride;
     dpy_gfx_replace_surface(scanout->con, NULL);
     dpy_gfx_replace_surface(scanout->con, scanout->ds);
-    res->scanout_bitmask = ss.scanout_id;
+    virtio_gpu_update_scanout(g, ss.scanout_id, res, &fb, &ss.r);
+}
+
+static void
+rutabaga_cmd_set_scanout_blob(VirtIOGPU *g,
+                              struct virtio_gpu_ctrl_command *cmd)
+{
+    struct virtio_gpu_framebuffer fb = { 0 };
+    struct virtio_gpu_set_scanout_blob ss;
+    struct virtio_gpu_simple_resource *res;
+    struct virtio_gpu_scanout *scanout;
+    pixman_image_t *rect;
+
+    VirtIOGPUBase *vb = VIRTIO_GPU_BASE(g);
+    VirtIOGPURutabaga *vr = VIRTIO_GPU_RUTABAGA(g);
+    if (vr->headless) {
+        return;
+    }
+
+    VIRTIO_GPU_FILL_CMD(ss);
+    virtio_gpu_scanout_blob_bswap(&ss);
+    trace_virtio_gpu_cmd_set_scanout_blob(ss.scanout_id, ss.resource_id,
+                                          ss.r.width, ss.r.height, ss.r.x,
+                                          ss.r.y);
+
+    if (ss.scanout_id >= g->parent_obj.conf.max_outputs) {
+        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID;
+        return;
+    }
+
+    if (ss.resource_id == 0) {
+        virtio_gpu_disable_scanout(g, ss.scanout_id);
+        return;
+    }
+
+    res = virtio_gpu_find_resource(g, ss.resource_id);
+    CHECK(res, cmd);
+    CHECK(res->blob, cmd);
+
+    if (!virtio_gpu_scanout_blob_to_fb(&fb, &ss, res->blob_size)) {
+        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
+        return;
+    }
+
+    res->width = ss.width;
+    res->height = ss.height;
+    res->format = ss.format;
+
+    vb->enable = 1;
+    scanout = &vb->scanout[ss.scanout_id];
+    rect = pixman_image_create_bits(fb.format, ss.r.width, ss.r.height,
+                                    (uint32_t *)((uint8_t *)res->blob +
+                                                 fb.offset),
+                                    fb.stride);
+    CHECK(rect, cmd);
+
+    scanout->ds = qemu_create_displaysurface_pixman(rect);
+    pixman_image_unref(rect);
+    dpy_gfx_replace_surface(scanout->con, NULL);
+    dpy_gl_scanout_disable(scanout->con);
+    dpy_gfx_replace_surface(scanout->con, scanout->ds);
+    virtio_gpu_update_scanout(g, ss.scanout_id, res, &fb, &ss.r);
 }
 
 static void
@@ -653,6 +785,7 @@ rutabaga_cmd_resource_create_blob(VirtIOGPU *g,
     CHECK(cblob.resource_id != 0, cmd);
 
     res = g_new0(struct virtio_gpu_simple_resource, 1);
+    res->dmabuf_fd = -1;
 
     res->resource_id = cblob.resource_id;
     res->blob_size = cblob.size;
@@ -703,6 +836,7 @@ rutabaga_cmd_resource_map_blob(VirtIOGPU *g,
     VirtIOGPURutabaga *vr = VIRTIO_GPU_RUTABAGA(g);
 
     VIRTIO_GPU_FILL_CMD(mblob);
+    virtio_gpu_map_blob_bswap(&mblob);
 
     CHECK(mblob.resource_id != 0, cmd);
 
@@ -723,6 +857,7 @@ rutabaga_cmd_resource_map_blob(VirtIOGPU *g,
     current_slot = rutabaga_find_mapping_slot(vr, mblob.resource_id);
     if (current_slot >= 0) {
         rutabaga_release_mapping_slot(vb, vr, current_slot);
+        res->blob = NULL;
 
         result = rutabaga_resource_unmap(vr->rutabaga, mblob.resource_id);
         CHECK(!result, cmd);
@@ -760,6 +895,7 @@ rutabaga_cmd_resource_map_blob(VirtIOGPU *g,
     }
 
     CHECK(slot < MAX_SLOTS, cmd);
+    res->blob = mapping.ptr;
 
     resp.hdr.type = VIRTIO_GPU_RESP_OK_MAP_INFO;
     virtio_gpu_ctrl_response(g, cmd, &resp.hdr, sizeof(resp));
@@ -778,6 +914,7 @@ rutabaga_cmd_resource_unmap_blob(VirtIOGPU *g,
     VirtIOGPURutabaga *vr = VIRTIO_GPU_RUTABAGA(g);
 
     VIRTIO_GPU_FILL_CMD(ublob);
+    virtio_gpu_unmap_blob_bswap(&ublob);
 
     CHECK(ublob.resource_id != 0, cmd);
 
@@ -788,6 +925,7 @@ rutabaga_cmd_resource_unmap_blob(VirtIOGPU *g,
     CHECK(slot >= 0, cmd);
 
     rutabaga_release_mapping_slot(vb, vr, slot);
+    res->blob = NULL;
     result = rutabaga_resource_unmap(vr->rutabaga, res->resource_id);
     CHECK(!result, cmd);
 }
@@ -836,6 +974,9 @@ virtio_gpu_rutabaga_process_cmd(VirtIOGPU *g,
         break;
     case VIRTIO_GPU_CMD_SET_SCANOUT:
         rutabaga_cmd_set_scanout(g, cmd);
+        break;
+    case VIRTIO_GPU_CMD_SET_SCANOUT_BLOB:
+        rutabaga_cmd_set_scanout_blob(g, cmd);
         break;
     case VIRTIO_GPU_CMD_RESOURCE_FLUSH:
         rutabaga_cmd_resource_flush(g, cmd);
