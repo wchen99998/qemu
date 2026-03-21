@@ -28,6 +28,31 @@ struct rutabaga_aio_data {
     struct rutabaga_fence fence;
 };
 
+static int rutabaga_find_mapping_slot(VirtIOGPURutabaga *vr, uint32_t resource_id)
+{
+    uint32_t slot;
+
+    for (slot = 0; slot < MAX_SLOTS; slot++) {
+        if (vr->memory_regions[slot].used &&
+            vr->memory_regions[slot].resource_id == resource_id) {
+            return slot;
+        }
+    }
+
+    return -1;
+}
+
+static void rutabaga_release_mapping_slot(VirtIOGPUBase *vb,
+                                          VirtIOGPURutabaga *vr,
+                                          uint32_t slot)
+{
+    MemoryRegion *mr = &vr->memory_regions[slot].mr;
+
+    memory_region_del_subregion(&vb->hostmem, mr);
+    vr->memory_regions[slot].resource_id = 0;
+    vr->memory_regions[slot].used = 0;
+}
+
 static void
 virtio_gpu_rutabaga_update_cursor(VirtIOGPU *g, struct virtio_gpu_scanout *s,
                                   uint32_t resource_id)
@@ -152,16 +177,34 @@ virtio_gpu_rutabaga_resource_unref(VirtIOGPU *g,
                                    struct virtio_gpu_simple_resource *res,
                                    Error **errp)
 {
+    VirtIOGPUBase *vb = VIRTIO_GPU_BASE(g);
     int32_t result;
+    Error *local_err = NULL;
     VirtIOGPURutabaga *vr = VIRTIO_GPU_RUTABAGA(g);
+    int slot = rutabaga_find_mapping_slot(vr, res->resource_id);
+
+    if (slot >= 0) {
+        rutabaga_release_mapping_slot(vb, vr, slot);
+
+        result = rutabaga_resource_unmap(vr->rutabaga, res->resource_id);
+        if (result) {
+            error_setg_errno(&local_err,
+                             (int)result,
+                             "%s: rutabaga_resource_unmap returned %"PRIi32
+                             " for resource_id = %"PRIu32,
+                             __func__, result, res->resource_id);
+        }
+    }
 
     result = rutabaga_resource_unref(vr->rutabaga, res->resource_id);
     if (result) {
-        error_setg_errno(errp,
-                        (int)result,
-                        "%s: rutabaga_resource_unref returned %"PRIi32
-                        " for resource_id = %"PRIu32, __func__, result,
-                        res->resource_id);
+        if (!local_err) {
+            error_setg_errno(&local_err,
+                             (int)result,
+                             "%s: rutabaga_resource_unref returned %"PRIi32
+                             " for resource_id = %"PRIu32,
+                             __func__, result, res->resource_id);
+        }
     }
 
     if (res->image) {
@@ -170,6 +213,8 @@ virtio_gpu_rutabaga_resource_unref(VirtIOGPU *g,
 
     QTAILQ_REMOVE(&g->reslist, res, next);
     g_free(res);
+
+    error_propagate(errp, local_err);
 }
 
 static void
@@ -647,6 +692,7 @@ rutabaga_cmd_resource_map_blob(VirtIOGPU *g,
 {
     int32_t result;
     uint32_t map_info = 0;
+    int current_slot;
     uint32_t slot = 0;
     struct virtio_gpu_simple_resource *res;
     struct rutabaga_mapping mapping = { 0 };
@@ -673,6 +719,14 @@ rutabaga_cmd_resource_map_blob(VirtIOGPU *g,
      * memory. QEMU does not need to use this functionality at the moment.
      */
     resp.map_info = map_info & RUTABAGA_MAP_CACHE_MASK;
+
+    current_slot = rutabaga_find_mapping_slot(vr, mblob.resource_id);
+    if (current_slot >= 0) {
+        rutabaga_release_mapping_slot(vb, vr, current_slot);
+
+        result = rutabaga_resource_unmap(vr->rutabaga, mblob.resource_id);
+        CHECK(!result, cmd);
+    }
 
     result = rutabaga_resource_map(vr->rutabaga, mblob.resource_id, &mapping);
     CHECK(!result, cmd);
@@ -716,7 +770,7 @@ rutabaga_cmd_resource_unmap_blob(VirtIOGPU *g,
                                  struct virtio_gpu_ctrl_command *cmd)
 {
     int32_t result;
-    uint32_t slot = 0;
+    int slot;
     struct virtio_gpu_simple_resource *res;
     struct virtio_gpu_resource_unmap_blob ublob;
 
@@ -730,20 +784,10 @@ rutabaga_cmd_resource_unmap_blob(VirtIOGPU *g,
     res = virtio_gpu_find_resource(g, ublob.resource_id);
     CHECK(res, cmd);
 
-    for (slot = 0; slot < MAX_SLOTS; slot++) {
-        if (vr->memory_regions[slot].resource_id != ublob.resource_id) {
-            continue;
-        }
+    slot = rutabaga_find_mapping_slot(vr, ublob.resource_id);
+    CHECK(slot >= 0, cmd);
 
-        MemoryRegion *mr = &(vr->memory_regions[slot].mr);
-        memory_region_del_subregion(&vb->hostmem, mr);
-
-        vr->memory_regions[slot].resource_id = 0;
-        vr->memory_regions[slot].used = 0;
-        break;
-    }
-
-    CHECK(slot < MAX_SLOTS, cmd);
+    rutabaga_release_mapping_slot(vb, vr, slot);
     result = rutabaga_resource_unmap(vr->rutabaga, res->resource_id);
     CHECK(!result, cmd);
 }
