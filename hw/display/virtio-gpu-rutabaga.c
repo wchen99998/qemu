@@ -951,6 +951,7 @@ virtio_gpu_rutabaga_debug_cb(uint64_t user_data,
 static bool virtio_gpu_rutabaga_init(VirtIOGPU *g, Error **errp)
 {
     int result;
+    const char *env_renderer_features;
     struct rutabaga_builder builder = { 0 };
     struct rutabaga_channel channel = { 0 };
     struct rutabaga_channels channels = { 0 };
@@ -1021,6 +1022,13 @@ static bool virtio_gpu_rutabaga_init(VirtIOGPU *g, Error **errp)
             channels.num_channels = 1;
             builder.channels = &channels;
         }
+    }
+
+    env_renderer_features = g_getenv("QEMU_RUTABAGA_GFXSTREAM_FEATURES");
+    if (vr->gfxstream_features && vr->gfxstream_features[0]) {
+        builder.renderer_features = vr->gfxstream_features;
+    } else if (env_renderer_features && env_renderer_features[0]) {
+        builder.renderer_features = env_renderer_features;
     }
 
     result = rutabaga_init(&builder, &vr->rutabaga);
@@ -1105,6 +1113,8 @@ static const Property virtio_gpu_rutabaga_properties[] = {
                       RUTABAGA_CAPSET_GFXSTREAM_GLES, false),
     DEFINE_PROP_BIT64("x-gfxstream-composer", VirtIOGPURutabaga, capset_mask,
                       RUTABAGA_CAPSET_GFXSTREAM_COMPOSER, false),
+    DEFINE_PROP_STRING("x-gfxstream-features", VirtIOGPURutabaga,
+                       gfxstream_features),
     DEFINE_PROP_STRING("wayland-socket-path", VirtIOGPURutabaga,
                        wayland_socket_path),
     DEFINE_PROP_STRING("wsi", VirtIOGPURutabaga, wsi),

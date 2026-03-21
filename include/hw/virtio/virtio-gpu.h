@@ -282,6 +282,7 @@ struct VirtIOGPURutabaga {
     VirtIOGPU parent_obj;
     struct MemoryRegionInfo memory_regions[MAX_SLOTS];
     uint64_t capset_mask;
+    char *gfxstream_features;
     char *wayland_socket_path;
     char *wsi;
     bool headless;
