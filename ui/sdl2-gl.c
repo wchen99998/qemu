@@ -192,11 +192,15 @@ int sdl2_gl_make_context_current(DisplayGLCtx *dgc,
 void sdl2_gl_scanout_disable(DisplayChangeListener *dcl)
 {
     struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
+    bool was_scanout = scon->scanout_mode;
 
     assert(scon->opengl);
     scon->w = 0;
     scon->h = 0;
     sdl2_set_scanout_mode(scon, false);
+    if (was_scanout) {
+        sdl2_window_resize(scon);
+    }
 }
 
 void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
@@ -209,6 +213,7 @@ void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
                              void *d3d_tex2d)
 {
     struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
+    bool resize = !scon->scanout_mode || scon->w != w || scon->h != h;
 
     assert(scon->opengl);
     scon->x = x;
@@ -220,6 +225,9 @@ void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
     SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
 
     sdl2_set_scanout_mode(scon, true);
+    if (resize) {
+        sdl2_window_resize(scon);
+    }
     gl_fb_setup_for_tex(&scon->guest_fb, backing_width, backing_height,
                         backing_id, false);
 }
