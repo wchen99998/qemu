@@ -65,6 +65,44 @@ static Notifier mouse_mode_notifier;
 
 static void sdl_update_caption(struct sdl2_console *scon);
 
+static void sdl2_update_native_surface(struct sdl2_console *scon)
+{
+#ifdef __APPLE__
+    QemuConsole *con = scon->dcl.con;
+
+    if (!scon->real_window) {
+        qemu_console_set_native_surface(con, NULL, 0, 0, 0, 0, 1.0f);
+        return;
+    }
+
+    SDL_SysWMinfo wmInfo;
+    int width_pt, height_pt, width_px, height_px;
+    float dpr = 1.0f;
+
+    SDL_VERSION(&wmInfo.version);
+    SDL_GetWindowSize(scon->real_window, &width_pt, &height_pt);
+
+    if (scon->opengl) {
+        SDL_GL_GetDrawableSize(scon->real_window, &width_px, &height_px);
+    } else {
+        width_px = width_pt;
+        height_px = height_pt;
+    }
+
+    if (width_pt > 0) {
+        dpr = (float)width_px / (float)width_pt;
+    }
+
+    if (SDL_GetWindowWMInfo(scon->real_window, &wmInfo)) {
+        void *nswindow = wmInfo.info.cocoa.window;
+        qemu_console_set_native_surface(con, nswindow,
+                                        width_pt, height_pt,
+                                        width_px, height_px,
+                                        dpr);
+    }
+#endif
+}
+
 static struct sdl2_console *get_scon_from_window(uint32_t window_id)
 {
     int i;
@@ -121,6 +159,7 @@ void sdl2_window_create(struct sdl2_console *scon)
         scon->real_renderer = SDL_CreateRenderer(scon->real_window, -1, 0);
     }
     sdl_update_caption(scon);
+    sdl2_update_native_surface(scon);
 }
 
 void sdl2_window_destroy(struct sdl2_console *scon)
@@ -128,6 +167,8 @@ void sdl2_window_destroy(struct sdl2_console *scon)
     if (!scon->real_window) {
         return;
     }
+
+    qemu_console_set_native_surface(scon->dcl.con, NULL, 0, 0, 0, 0, 1.0f);
 
     if (scon->winctx) {
         SDL_GL_DeleteContext(scon->winctx);
@@ -597,6 +638,7 @@ static void handle_windowevent(SDL_Event *ev)
             info.height = ev->window.data2;
             dpy_set_ui_info(scon->dcl.con, &info, true);
         }
+        sdl2_update_native_surface(scon);
         sdl2_redraw(scon);
         break;
     case SDL_WINDOWEVENT_EXPOSED:

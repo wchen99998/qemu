@@ -292,6 +292,57 @@ rutabaga_cmd_context_destroy(VirtIOGPU *g,
     CHECK(!result, cmd);
 }
 
+static void rutabaga_sync_native_surface(VirtIOGPURutabaga *vr,
+                                         uint32_t scanout_id,
+                                         QemuConsole *con)
+{
+    void *handle = NULL;
+    int width_pt = 0, height_pt = 0, width_px = 0, height_px = 0;
+    float dpr = 1.0f;
+    bool has_surface = qemu_console_get_native_surface(
+        con, &handle, &width_pt, &height_pt, &width_px, &height_px, &dpr);
+
+    if (!has_surface && vr->native_surface_active[scanout_id]) {
+        rutabaga_teardown_native_surface(vr->rutabaga, scanout_id);
+        vr->native_surface_active[scanout_id] = false;
+        return;
+    }
+
+    if (has_surface && !vr->native_surface_active[scanout_id]) {
+        int ret = rutabaga_setup_native_surface(
+            vr->rutabaga, scanout_id, handle,
+            width_pt, height_pt, width_px, height_px, dpr);
+        if (ret == 0) {
+            vr->native_surface_active[scanout_id] = true;
+            vr->native_surface_width_pt[scanout_id] = width_pt;
+            vr->native_surface_height_pt[scanout_id] = height_pt;
+            vr->native_surface_width_px[scanout_id] = width_px;
+            vr->native_surface_height_px[scanout_id] = height_px;
+            vr->native_surface_dpr[scanout_id] = dpr;
+        }
+        return;
+    }
+
+    if (has_surface && vr->native_surface_active[scanout_id]) {
+        if (width_pt != vr->native_surface_width_pt[scanout_id] ||
+            height_pt != vr->native_surface_height_pt[scanout_id] ||
+            width_px != vr->native_surface_width_px[scanout_id] ||
+            height_px != vr->native_surface_height_px[scanout_id] ||
+            dpr != vr->native_surface_dpr[scanout_id]) {
+            int ret = rutabaga_resize_native_surface(
+                vr->rutabaga, scanout_id,
+                width_pt, height_pt, width_px, height_px, dpr);
+            if (ret == 0) {
+                vr->native_surface_width_pt[scanout_id] = width_pt;
+                vr->native_surface_height_pt[scanout_id] = height_pt;
+                vr->native_surface_width_px[scanout_id] = width_px;
+                vr->native_surface_height_px[scanout_id] = height_px;
+                vr->native_surface_dpr[scanout_id] = dpr;
+            }
+        }
+    }
+}
+
 static void
 rutabaga_cmd_resource_flush(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd)
 {
@@ -327,6 +378,17 @@ rutabaga_cmd_resource_flush(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd)
                 rf.r.y < scanout->y + scanout->height &&
                 rf.r.y + rf.r.height >= scanout->y) {
                 within_bounds = true;
+
+                rutabaga_sync_native_surface(vr, i, scanout->con);
+
+                {
+                    int present_ret = rutabaga_present_flushed_resource(
+                        vr->rutabaga, rf.resource_id,
+                        rf.r.x, rf.r.y, rf.r.width, rf.r.height);
+                    if (present_ret > 0) {
+                        return;  /* native surface handled the present */
+                    }
+                }
 
                 if (console_has_gl(scanout->con)) {
                     dpy_gl_update(scanout->con, 0, 0, scanout->width,
@@ -417,6 +479,7 @@ rutabaga_cmd_set_scanout(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd)
     scanout = &vb->scanout[ss.scanout_id];
 
     if (ss.resource_id == 0) {
+        rutabaga_set_scanout_resource(vr->rutabaga, ss.scanout_id, 0, 0, 0);
         virtio_gpu_disable_scanout(g, ss.scanout_id);
         return;
     }
@@ -450,6 +513,8 @@ rutabaga_cmd_set_scanout(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd)
     dpy_gfx_replace_surface(scanout->con, NULL);
     dpy_gfx_replace_surface(scanout->con, scanout->ds);
     virtio_gpu_update_scanout(g, ss.scanout_id, res, &fb, &ss.r);
+    rutabaga_set_scanout_resource(vr->rutabaga, ss.scanout_id,
+                                  ss.resource_id, fb.width, fb.height);
 }
 
 static void
@@ -480,6 +545,7 @@ rutabaga_cmd_set_scanout_blob(VirtIOGPU *g,
     }
 
     if (ss.resource_id == 0) {
+        rutabaga_set_scanout_resource(vr->rutabaga, ss.scanout_id, 0, 0, 0);
         virtio_gpu_disable_scanout(g, ss.scanout_id);
         return;
     }
@@ -511,6 +577,9 @@ rutabaga_cmd_set_scanout_blob(VirtIOGPU *g,
     dpy_gl_scanout_disable(scanout->con);
     dpy_gfx_replace_surface(scanout->con, scanout->ds);
     virtio_gpu_update_scanout(g, ss.scanout_id, res, &fb, &ss.r);
+    rutabaga_set_scanout_resource(vr->rutabaga, ss.scanout_id,
+                                  ss.resource_id, ss.width, ss.height);
+    rutabaga_sync_native_surface(vr, ss.scanout_id, scanout->con);
 }
 
 static void
@@ -1162,6 +1231,9 @@ static bool virtio_gpu_rutabaga_init(VirtIOGPU *g, Error **errp)
             vr->headless = false;
         } else if (g_str_equal(vr->wsi, "headless")) {
             vr->headless = true;
+        } else if (g_str_equal(vr->wsi, "vulkan-swapchain")) {
+            builder.wsi = RUTABAGA_WSI_VULKAN_SWAPCHAIN;
+            vr->headless = false;
         } else {
             error_setg(errp, "invalid wsi option selected");
             return false;

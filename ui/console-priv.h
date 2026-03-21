@@ -26,6 +26,12 @@ struct QemuConsole {
     int gl_block;
     QEMUTimer *gl_unblock_timer;
     int window_id;
+    void *native_surface_handle;
+    int native_surface_width_pt;
+    int native_surface_height_pt;
+    int native_surface_width_px;
+    int native_surface_height_px;
+    float native_surface_dpr;
     QemuUIInfo ui_info;
     QEMUTimer *ui_timer;
     const GraphicHwOps *hw_ops;

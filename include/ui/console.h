@@ -411,6 +411,15 @@ int qemu_console_get_window_id(QemuConsole *con);
 /* Set the low-level window id for the console */
 void qemu_console_set_window_id(QemuConsole *con, int window_id);
 
+void qemu_console_set_native_surface(QemuConsole *con, void *handle,
+                                     int width_pt, int height_pt,
+                                     int width_px, int height_px,
+                                     float dpr);
+bool qemu_console_get_native_surface(QemuConsole *con, void **handle,
+                                     int *width_pt, int *height_pt,
+                                     int *width_px, int *height_px,
+                                     float *dpr);
+
 void qemu_console_resize(QemuConsole *con, int width, int height);
 DisplaySurface *qemu_console_surface(QemuConsole *con);
 void coroutine_fn qemu_console_co_wait_update(QemuConsole *con);

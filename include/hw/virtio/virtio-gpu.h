@@ -288,6 +288,12 @@ struct VirtIOGPURutabaga {
     bool headless;
     uint32_t num_capsets;
     struct rutabaga *rutabaga;
+    bool native_surface_active[VIRTIO_GPU_MAX_SCANOUTS];
+    int native_surface_width_pt[VIRTIO_GPU_MAX_SCANOUTS];
+    int native_surface_height_pt[VIRTIO_GPU_MAX_SCANOUTS];
+    int native_surface_width_px[VIRTIO_GPU_MAX_SCANOUTS];
+    int native_surface_height_px[VIRTIO_GPU_MAX_SCANOUTS];
+    float native_surface_dpr[VIRTIO_GPU_MAX_SCANOUTS];
 };
 
 #define VIRTIO_GPU_FILL_CMD(out) do {                                   \

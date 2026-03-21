@@ -207,6 +207,36 @@ void qemu_console_set_window_id(QemuConsole *con, int window_id)
     con->window_id = window_id;
 }
 
+void qemu_console_set_native_surface(QemuConsole *con, void *handle,
+                                     int width_pt, int height_pt,
+                                     int width_px, int height_px,
+                                     float dpr)
+{
+    con->native_surface_handle = handle;
+    con->native_surface_width_pt = width_pt;
+    con->native_surface_height_pt = height_pt;
+    con->native_surface_width_px = width_px;
+    con->native_surface_height_px = height_px;
+    con->native_surface_dpr = dpr;
+}
+
+bool qemu_console_get_native_surface(QemuConsole *con, void **handle,
+                                     int *width_pt, int *height_pt,
+                                     int *width_px, int *height_px,
+                                     float *dpr)
+{
+    if (!con->native_surface_handle) {
+        return false;
+    }
+    if (handle) *handle = con->native_surface_handle;
+    if (width_pt) *width_pt = con->native_surface_width_pt;
+    if (height_pt) *height_pt = con->native_surface_height_pt;
+    if (width_px) *width_px = con->native_surface_width_px;
+    if (height_px) *height_px = con->native_surface_height_px;
+    if (dpr) *dpr = con->native_surface_dpr;
+    return true;
+}
+
 void graphic_hw_invalidate(QemuConsole *con)
 {
     if (con && con->hw_ops->invalidate) {
@@ -414,6 +444,12 @@ qemu_console_init(Object *obj)
     qemu_co_queue_init(&c->dump_queue);
     c->ds = ds;
     c->window_id = -1;
+    c->native_surface_handle = NULL;
+    c->native_surface_width_pt = 0;
+    c->native_surface_height_pt = 0;
+    c->native_surface_width_px = 0;
+    c->native_surface_height_px = 0;
+    c->native_surface_dpr = 1.0f;
     c->ui_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
                                dpy_set_ui_info_timer, c);
     qemu_console_register(c);
