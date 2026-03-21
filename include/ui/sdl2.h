@@ -23,7 +23,7 @@
 
 #include "ui/kbd-state.h"
 #ifdef CONFIG_OPENGL
-# include "ui/egl-helpers.h"
+# include "ui/gl-fb-helpers.h"
 #endif
 
 struct sdl2_console {
@@ -47,8 +47,8 @@ struct sdl2_console {
     QKbdState *kbd;
 #ifdef CONFIG_OPENGL
     QemuGLShader *gls;
-    egl_fb guest_fb;
-    egl_fb win_fb;
+    gl_fb guest_fb;
+    gl_fb win_fb;
     bool y0_top;
     bool scanout_mode;
 #endif

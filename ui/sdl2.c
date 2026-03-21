@@ -26,6 +26,7 @@
 #include "qemu/osdep.h"
 #include "qemu/module.h"
 #include "qemu/cutils.h"
+#include "qemu/error-report.h"
 #include "ui/console.h"
 #include "ui/input.h"
 #include "ui/sdl2.h"
@@ -65,6 +66,35 @@ static Notifier mouse_mode_notifier;
 
 static void sdl_update_caption(struct sdl2_console *scon);
 
+#ifdef CONFIG_OPENGL
+static SDL_GLContext sdl2_window_create_gl_context(struct sdl2_console *scon,
+                                                   DisplayGLMode mode)
+{
+    int major = 3;
+    int minor = (mode == DISPLAY_GL_MODE_ES) ? 0 : 2;
+
+    SDL_GL_ResetAttributes();
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+
+    if (mode == DISPLAY_GL_MODE_ES) {
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
+                            SDL_GL_CONTEXT_PROFILE_ES);
+    } else {
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
+                            SDL_GL_CONTEXT_PROFILE_CORE);
+#ifdef CONFIG_DARWIN
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS,
+                            SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG);
+#endif
+    }
+
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, major);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, minor);
+
+    return SDL_GL_CreateContext(scon->real_window);
+}
+#endif
+
 static void sdl2_update_native_surface(struct sdl2_console *scon)
 {
 #ifdef __APPLE__
@@ -99,6 +129,8 @@ static void sdl2_update_native_surface(struct sdl2_console *scon)
                                         width_pt, height_pt,
                                         width_px, height_px,
                                         dpr);
+    } else {
+        warn_report("sdl2: SDL_GetWindowWMInfo failed for native surface");
     }
 #endif
 }
@@ -152,7 +184,20 @@ void sdl2_window_create(struct sdl2_console *scon)
         SDL_SetHint(SDL_HINT_RENDER_DRIVER, driver);
         SDL_SetHint(SDL_HINT_RENDER_BATCHING, "1");
 
-        scon->winctx = SDL_GL_CreateContext(scon->real_window);
+        scon->winctx = sdl2_window_create_gl_context(scon, scon->opts->gl);
+#ifndef CONFIG_DARWIN
+        if (!scon->winctx && scon->opts->gl == DISPLAY_GL_MODE_ON) {
+            /* macOS has no GLES support; this fallback is for Linux only */
+            SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengles2");
+            scon->winctx = sdl2_window_create_gl_context(scon,
+                                                         DISPLAY_GL_MODE_ES);
+        }
+#endif
+        if (!scon->winctx) {
+            error_report("sdl2: failed to create main GL context: %s",
+                         SDL_GetError());
+            exit(1);
+        }
         SDL_GL_SetSwapInterval(0);
     } else {
         /* The SDL renderer is only used by sdl2-2D, when OpenGL is disabled */

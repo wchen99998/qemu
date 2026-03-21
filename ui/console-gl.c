@@ -35,12 +35,36 @@ bool console_gl_check_format(DisplayChangeListener *dcl,
                              pixman_format_code_t format)
 {
     switch (format) {
-    case PIXMAN_BE_b8g8r8x8:
-    case PIXMAN_BE_b8g8r8a8:
+    case PIXMAN_x8r8g8b8:
+    case PIXMAN_a8r8g8b8:
+    case PIXMAN_x8b8g8r8:
+    case PIXMAN_a8b8g8r8:
     case PIXMAN_r5g6b5:
         return true;
     default:
         return false;
+    }
+}
+
+static void surface_gl_assign_pixel_format(DisplaySurface *surface)
+{
+    switch (surface_format(surface)) {
+    case PIXMAN_x8r8g8b8:
+    case PIXMAN_a8r8g8b8:
+        surface->glformat = GL_BGRA_EXT;
+        surface->gltype = GL_UNSIGNED_BYTE;
+        break;
+    case PIXMAN_x8b8g8r8:
+    case PIXMAN_a8b8g8r8:
+        surface->glformat = GL_RGBA;
+        surface->gltype = GL_UNSIGNED_BYTE;
+        break;
+    case PIXMAN_r5g6b5:
+        surface->glformat = GL_RGB;
+        surface->gltype = GL_UNSIGNED_SHORT_5_6_5;
+        break;
+    default:
+        g_assert_not_reached();
     }
 }
 
@@ -54,27 +78,9 @@ void surface_gl_create_texture(QemuGLShader *gls,
         return;
     }
 
-    switch (surface_format(surface)) {
-    case PIXMAN_BE_b8g8r8x8:
-    case PIXMAN_BE_b8g8r8a8:
-        surface->glformat = GL_BGRA_EXT;
-        surface->gltype = GL_UNSIGNED_BYTE;
-        break;
-    case PIXMAN_BE_x8r8g8b8:
-    case PIXMAN_BE_a8r8g8b8:
-        surface->glformat = GL_RGBA;
-        surface->gltype = GL_UNSIGNED_BYTE;
-        break;
-    case PIXMAN_r5g6b5:
-        surface->glformat = GL_RGB;
-        surface->gltype = GL_UNSIGNED_SHORT_5_6_5;
-        break;
-    default:
-        g_assert_not_reached();
-    }
+    surface_gl_assign_pixel_format(surface);
 
     glGenTextures(1, &surface->texture);
-    glEnable(GL_TEXTURE_2D);
     glBindTexture(GL_TEXTURE_2D, surface->texture);
     glPixelStorei(GL_UNPACK_ROW_LENGTH_EXT,
                   surface_stride(surface) / surface_bytes_per_pixel(surface));

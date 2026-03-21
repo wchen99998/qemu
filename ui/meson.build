@@ -58,12 +58,17 @@ system_ss.add(opengl)
 if opengl.found()
   opengl_ss = ss.source_set()
   opengl_ss.add(gbm, pixman)
-  opengl_ss.add(when: [opengl],
-               if_true: files('shader.c', 'console-gl.c', 'egl-helpers.c', 'egl-context.c'))
+  if host_os == 'darwin'
+    opengl_ss.add(when: [opengl],
+                 if_true: files('shader.c', 'console-gl.c', 'gl-fb-helpers.c'))
+  else
+    opengl_ss.add(when: [opengl],
+                 if_true: files('shader.c', 'console-gl.c', 'egl-helpers.c', 'egl-context.c'))
+  endif
   ui_modules += {'opengl' : opengl_ss}
 endif
 
-if opengl.found()
+if opengl.found() and host_os != 'darwin'
   egl_headless_ss = ss.source_set()
   egl_headless_ss.add(when: [opengl, pixman],
                       if_true: [files('egl-headless.c'), gbm])

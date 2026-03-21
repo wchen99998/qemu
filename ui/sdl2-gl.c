@@ -38,7 +38,7 @@ static void sdl2_set_scanout_mode(struct sdl2_console *scon, bool scanout)
 
     scon->scanout_mode = scanout;
     if (!scon->scanout_mode) {
-        egl_fb_destroy(&scon->guest_fb);
+        gl_fb_destroy(&scon->guest_fb);
         if (scon->surface) {
             surface_gl_destroy_texture(scon->gls, scon->surface);
             surface_gl_create_texture(scon->gls, scon->surface);
@@ -220,8 +220,8 @@ void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
     SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
 
     sdl2_set_scanout_mode(scon, true);
-    egl_fb_setup_for_tex(&scon->guest_fb, backing_width, backing_height,
-                         backing_id, false);
+    gl_fb_setup_for_tex(&scon->guest_fb, backing_width, backing_height,
+                        backing_id, false);
 }
 
 void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
@@ -241,8 +241,8 @@ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
     SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
 
     SDL_GetWindowSize(scon->real_window, &ww, &wh);
-    egl_fb_setup_default(&scon->win_fb, ww, wh, 0, 0);
-    egl_fb_blit(&scon->win_fb, &scon->guest_fb, !scon->y0_top);
+    gl_fb_setup_default(&scon->win_fb, ww, wh, 0, 0);
+    gl_fb_blit(&scon->win_fb, &scon->guest_fb, !scon->y0_top);
 
     SDL_GL_SwapWindow(scon->real_window);
 }

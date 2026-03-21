@@ -1806,8 +1806,10 @@ if not get_option('opengl').auto() or have_system or have_vhost_user_gpu
                       required: get_option('opengl'))
   if cc.has_header('epoxy/egl.h', dependencies: epoxy)
     opengl = epoxy
+  elif host_os == 'darwin' and cc.has_header('epoxy/gl.h', dependencies: epoxy)
+    opengl = epoxy
   elif get_option('opengl').enabled()
-    error('epoxy/egl.h not found')
+    error(host_os == 'darwin' ? 'epoxy/gl.h not found' : 'epoxy/egl.h not found')
   endif
 endif
 gbm = not_found

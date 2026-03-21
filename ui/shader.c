@@ -37,6 +37,39 @@ struct QemuGLShader {
     GLint texture_blit_vao;
 };
 
+static const GLchar texture_blit_vert_desktop_src[] =
+    "#version 150\n"
+    "\n"
+    "in vec2 in_position;\n"
+    "out vec2 ex_tex_coord;\n"
+    "\n"
+    "void main(void) {\n"
+    "    gl_Position = vec4(in_position, 0.0, 1.0);\n"
+    "    ex_tex_coord = vec2(1.0 + in_position.x, 1.0 - in_position.y) * 0.5;\n"
+    "}\n";
+
+static const GLchar texture_blit_flip_vert_desktop_src[] =
+    "#version 150\n"
+    "\n"
+    "in vec2 in_position;\n"
+    "out vec2 ex_tex_coord;\n"
+    "\n"
+    "void main(void) {\n"
+    "    gl_Position = vec4(in_position, 0.0, 1.0);\n"
+    "    ex_tex_coord = vec2(1.0 + in_position.x, 1.0 + in_position.y) * 0.5;\n"
+    "}\n";
+
+static const GLchar texture_blit_frag_desktop_src[] =
+    "#version 150\n"
+    "\n"
+    "uniform sampler2D image;\n"
+    "in vec2 ex_tex_coord;\n"
+    "out vec4 out_frag_color;\n"
+    "\n"
+    "void main(void) {\n"
+    "    out_frag_color = texture(image, ex_tex_coord);\n"
+    "}\n";
+
 /* ---------------------------------------------------------------------- */
 
 static GLuint qemu_gl_init_texture_blit(GLint texture_blit_prog)
@@ -152,11 +185,20 @@ end:
 QemuGLShader *qemu_gl_init_shader(void)
 {
     QemuGLShader *gls = g_new0(QemuGLShader, 1);
+    const GLchar *vert_src = texture_blit_vert_src;
+    const GLchar *flip_vert_src = texture_blit_flip_vert_src;
+    const GLchar *frag_src = texture_blit_frag_src;
+
+    if (epoxy_is_desktop_gl()) {
+        vert_src = texture_blit_vert_desktop_src;
+        flip_vert_src = texture_blit_flip_vert_desktop_src;
+        frag_src = texture_blit_frag_desktop_src;
+    }
 
     gls->texture_blit_prog = qemu_gl_create_compile_link_program
-        (texture_blit_vert_src, texture_blit_frag_src);
+        (vert_src, frag_src);
     gls->texture_blit_flip_prog = qemu_gl_create_compile_link_program
-        (texture_blit_flip_vert_src, texture_blit_frag_src);
+        (flip_vert_src, frag_src);
     if (!gls->texture_blit_prog || !gls->texture_blit_flip_prog) {
         exit(1);
     }
