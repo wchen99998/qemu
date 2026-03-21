@@ -1294,6 +1294,13 @@ static bool virtio_gpu_rutabaga_init(VirtIOGPU *g, Error **errp)
         return false;
     }
 
+    if (g->parent_obj.conf.refresh_rate) {
+        uint32_t vsync_hz = g->parent_obj.conf.refresh_rate / 1000;
+        if (vsync_hz > 0) {
+            rutabaga_set_vsync_hz(vr->rutabaga, vsync_hz);
+        }
+    }
+
     return true;
 }
 
@@ -1333,6 +1340,48 @@ static void virtio_gpu_rutabaga_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
     virtio_gpu_process_cmdq(g);
 }
 
+static void virtio_gpu_rutabaga_ui_info(void *opaque, uint32_t idx,
+                                        QemuUIInfo *info)
+{
+    VirtIOGPUBase *g = opaque;
+    VirtIOGPURutabaga *vr = VIRTIO_GPU_RUTABAGA(g);
+    bool refresh_changed = false;
+
+    if (idx >= g->conf.max_outputs) {
+        return;
+    }
+
+    /*
+     * SDL/DBus UI geometry reflects the host presentation window, not the
+     * guest scanout mode. Feeding that back into req_state makes the guest
+     * believe its physical display changed to the host window size
+     * (for example 640x480), which breaks Android layout and density.
+     *
+     * Rutabaga only needs host ui_info here to track display refresh changes
+     * for gfxstream's vsync thread. Keep the guest mode derived from the
+     * configured virtio-gpu output / guest scanout instead of the host window.
+     */
+    g->req_state[idx].x = info->xoff;
+    g->req_state[idx].y = info->yoff;
+
+    if (info->refresh_rate &&
+        info->refresh_rate != g->req_state[idx].refresh_rate) {
+        g->req_state[idx].refresh_rate = info->refresh_rate;
+        refresh_changed = true;
+        uint32_t vsync_hz = info->refresh_rate / 1000;
+        if (vsync_hz > 0 && vr->rutabaga) {
+            rutabaga_set_vsync_hz(vr->rutabaga, vsync_hz);
+        }
+    } else if (!info->refresh_rate) {
+        g->req_state[idx].refresh_rate = info->refresh_rate;
+    }
+
+    if (refresh_changed) {
+        g->virtio_config.events_read |= VIRTIO_GPU_EVENT_DISPLAY;
+        virtio_notify_config(&g->parent_obj);
+    }
+}
+
 static void virtio_gpu_rutabaga_realize(DeviceState *qdev, Error **errp)
 {
     int num_capsets;
@@ -1359,6 +1408,27 @@ static void virtio_gpu_rutabaga_realize(DeviceState *qdev, Error **errp)
 
     bdev->virtio_config.num_capsets = num_capsets;
     virtio_gpu_device_realize(qdev, errp);
+
+    /*
+     * Replace the base ui_info callback with a rutabaga-specific one
+     * that forwards host display refresh_rate into gfxstream's VsyncThread.
+     */
+    {
+        static GraphicHwOps rutabaga_ops;
+        static bool ops_initialized;
+        if (!ops_initialized) {
+            rutabaga_ops = *bdev->hw_ops;
+            rutabaga_ops.ui_info = virtio_gpu_rutabaga_ui_info;
+            ops_initialized = true;
+        }
+        bdev->hw_ops = &rutabaga_ops;
+        for (int i = 0; i < bdev->conf.max_outputs; i++) {
+            if (bdev->scanout[i].con) {
+                graphic_console_set_hwops(bdev->scanout[i].con,
+                                          &rutabaga_ops, bdev);
+            }
+        }
+    }
 }
 
 static const Property virtio_gpu_rutabaga_properties[] = {

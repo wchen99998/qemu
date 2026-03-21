@@ -55,9 +55,11 @@ static int guest_x, guest_y;
 static SDL_Cursor *guest_sprite;
 static Notifier mouse_mode_notifier;
 
-#define SDL2_REFRESH_INTERVAL_BUSY 10
-#define SDL2_MAX_IDLE_COUNT (2 * GUI_REFRESH_INTERVAL_DEFAULT \
-                             / SDL2_REFRESH_INTERVAL_BUSY + 1)
+#define SDL2_REFRESH_INTERVAL_BUSY_DEFAULT 10
+#define SDL2_MAX_IDLE_COUNT(scon) (2 * GUI_REFRESH_INTERVAL_DEFAULT \
+                             / ((scon)->refresh_interval_busy ? \
+                                (scon)->refresh_interval_busy : \
+                                SDL2_REFRESH_INTERVAL_BUSY_DEFAULT) + 1)
 
 /* introduced in SDL 2.0.10 */
 #ifndef SDL_HINT_RENDER_BATCHING
@@ -236,6 +238,35 @@ static struct sdl2_console *get_scon_from_window(uint32_t window_id)
     return NULL;
 }
 
+static void sdl2_update_refresh_rate(struct sdl2_console *scon)
+{
+    if (!scon->real_window) {
+        return;
+    }
+
+    int display_idx = SDL_GetWindowDisplayIndex(scon->real_window);
+    SDL_DisplayMode mode;
+    if (display_idx >= 0 &&
+        SDL_GetCurrentDisplayMode(display_idx, &mode) == 0 &&
+        mode.refresh_rate > 0) {
+        int interval = 1000 / mode.refresh_rate;
+        if (interval < 1) {
+            interval = 1;
+        }
+        scon->refresh_interval_busy = interval;
+
+        /* Propagate host display refresh rate to the guest GPU */
+        if (dpy_ui_info_supported(scon->dcl.con)) {
+            const QemuUIInfo *current = dpy_get_ui_info(scon->dcl.con);
+            if (current->width && current->height) {
+                QemuUIInfo info = *current;
+                info.refresh_rate = mode.refresh_rate * 1000; /* Hz → mHz */
+                dpy_set_ui_info(scon->dcl.con, &info, false);
+            }
+        }
+    }
+}
+
 void sdl2_window_create(struct sdl2_console *scon)
 {
     int flags = 0;
@@ -290,13 +321,33 @@ void sdl2_window_create(struct sdl2_console *scon)
                          SDL_GetError());
             exit(1);
         }
-        SDL_GL_SetSwapInterval(0);
+        {
+            const char *env_swap = g_getenv("QEMU_SDL_SWAP_INTERVAL");
+            int swap_interval = 0;
+            if (env_swap) {
+                swap_interval = atoi(env_swap);
+            }
+            SDL_GL_SetSwapInterval(swap_interval);
+        }
     } else {
         /* The SDL renderer is only used by sdl2-2D, when OpenGL is disabled */
         scon->real_renderer = SDL_CreateRenderer(scon->real_window, -1, 0);
     }
     sdl_update_caption(scon);
     sdl2_update_native_surface(scon);
+
+    /* Seed initial geometry so sdl2_update_refresh_rate can merge refresh_rate */
+    if (dpy_ui_info_supported(scon->dcl.con)) {
+        int win_w, win_h;
+        SDL_GetWindowSize(scon->real_window, &win_w, &win_h);
+        if (win_w > 0 && win_h > 0) {
+            QemuUIInfo info = *dpy_get_ui_info(scon->dcl.con);
+            info.width = win_w;
+            info.height = win_h;
+            dpy_set_ui_info(scon->dcl.con, &info, true);
+        }
+    }
+    sdl2_update_refresh_rate(scon);
 }
 
 void sdl2_window_destroy(struct sdl2_console *scon)
@@ -775,8 +826,7 @@ static void handle_windowevent(SDL_Event *ev)
     switch (ev->window.event) {
     case SDL_WINDOWEVENT_RESIZED:
         {
-            QemuUIInfo info;
-            memset(&info, 0, sizeof(info));
+            QemuUIInfo info = *dpy_get_ui_info(scon->dcl.con);
             info.width = ev->window.data1;
             info.height = ev->window.data2;
             dpy_set_ui_info(scon->dcl.con, &info, true);
@@ -806,6 +856,9 @@ static void handle_windowevent(SDL_Event *ev)
         if (gui_grab && !gui_fullscreen) {
             sdl_grab_end(scon);
         }
+        break;
+    case SDL_WINDOWEVENT_MOVED:
+        sdl2_update_refresh_rate(scon);
         break;
     case SDL_WINDOWEVENT_RESTORED:
         update_displaychangelistener(&scon->dcl, GUI_REFRESH_INTERVAL_DEFAULT);
@@ -892,15 +945,17 @@ void sdl2_poll_events(struct sdl2_console *scon)
     }
 
     if (idle) {
-        if (scon->idle_counter < SDL2_MAX_IDLE_COUNT) {
+        if (scon->idle_counter < SDL2_MAX_IDLE_COUNT(scon)) {
             scon->idle_counter++;
-            if (scon->idle_counter >= SDL2_MAX_IDLE_COUNT) {
+            if (scon->idle_counter >= SDL2_MAX_IDLE_COUNT(scon)) {
                 scon->dcl.update_interval = GUI_REFRESH_INTERVAL_DEFAULT;
             }
         }
     } else {
         scon->idle_counter = 0;
-        scon->dcl.update_interval = SDL2_REFRESH_INTERVAL_BUSY;
+        scon->dcl.update_interval = scon->refresh_interval_busy
+            ? scon->refresh_interval_busy
+            : SDL2_REFRESH_INTERVAL_BUSY_DEFAULT;
     }
 }
 
