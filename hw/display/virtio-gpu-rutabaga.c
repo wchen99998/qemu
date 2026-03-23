@@ -860,6 +860,35 @@ rutabaga_cmd_create_resource_3d(VirtIOGPU *g,
 }
 
 static void
+rutabaga_clear_scanout(VirtIOGPURutabaga *vr,
+                       VirtIOGPU *g,
+                       uint32_t scanout_id,
+                       bool teardown_native_surface)
+{
+    if (rutabaga_debug_scanout_trace_enabled()) {
+        error_report("%s: scanout=%u resource=%u teardown_native_surface=%d "
+                     "native_surface_active=%d",
+                     __func__, scanout_id,
+                     g->parent_obj.scanout[scanout_id].resource_id,
+                     teardown_native_surface ? 1 : 0,
+                     vr->native_surface_active[scanout_id] ? 1 : 0);
+    }
+
+    rutabaga_set_scanout_resource(vr->rutabaga, scanout_id, 0, 0, 0);
+    virtio_gpu_disable_scanout(g, scanout_id);
+
+    if (teardown_native_surface && vr->native_surface_active[scanout_id]) {
+        rutabaga_teardown_native_surface(vr->rutabaga, scanout_id);
+        vr->native_surface_active[scanout_id] = false;
+        vr->native_surface_width_pt[scanout_id] = 0;
+        vr->native_surface_height_pt[scanout_id] = 0;
+        vr->native_surface_width_px[scanout_id] = 0;
+        vr->native_surface_height_px[scanout_id] = 0;
+        vr->native_surface_dpr[scanout_id] = 1.0f;
+    }
+}
+
+static void
 virtio_gpu_rutabaga_resource_unref(VirtIOGPU *g,
                                    struct virtio_gpu_simple_resource *res,
                                    Error **errp)
@@ -874,7 +903,7 @@ virtio_gpu_rutabaga_resource_unref(VirtIOGPU *g,
     if (res->scanout_bitmask) {
         for (i = 0; i < g->parent_obj.conf.max_outputs; i++) {
             if (res->scanout_bitmask & (1 << i)) {
-                virtio_gpu_disable_scanout(g, i);
+                rutabaga_clear_scanout(vr, g, i, false);
             }
         }
     }
@@ -1218,8 +1247,7 @@ rutabaga_cmd_set_scanout(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd)
     scanout = &vb->scanout[ss.scanout_id];
 
     if (ss.resource_id == 0) {
-        rutabaga_set_scanout_resource(vr->rutabaga, ss.scanout_id, 0, 0, 0);
-        virtio_gpu_disable_scanout(g, ss.scanout_id);
+        rutabaga_clear_scanout(vr, g, ss.scanout_id, false);
         return;
     }
 
@@ -1298,8 +1326,7 @@ rutabaga_cmd_set_scanout_blob(VirtIOGPU *g,
     }
 
     if (ss.resource_id == 0) {
-        rutabaga_set_scanout_resource(vr->rutabaga, ss.scanout_id, 0, 0, 0);
-        virtio_gpu_disable_scanout(g, ss.scanout_id);
+        rutabaga_clear_scanout(vr, g, ss.scanout_id, false);
         return;
     }
 
@@ -2259,7 +2286,8 @@ static void virtio_gpu_rutabaga_reset_bh(VirtIOGPU *gpudev)
     }
 
     /*
-     * Tear down native surfaces before resources are destroyed.
+     * Clear scanout/resource bindings and tear down native surfaces before
+     * resources are destroyed.
      * With wsi=vulkan-swapchain gfxstream presents directly via a Vulkan
      * swapchain bound to the host window.  If we don't release it here the
      * SDL display listener cannot render the placeholder surface and the
@@ -2272,9 +2300,8 @@ static void virtio_gpu_rutabaga_reset_bh(VirtIOGPU *gpudev)
      * re-establishes the graphics pipeline after reboot.
      */
     for (int i = 0; i < g->conf.max_outputs; i++) {
-        if (vr->native_surface_active[i]) {
-            rutabaga_teardown_native_surface(vr->rutabaga, i);
-            vr->native_surface_active[i] = false;
+        if (g->scanout[i].resource_id || vr->native_surface_active[i]) {
+            rutabaga_clear_scanout(vr, gpudev, i, true);
         }
     }
 }
