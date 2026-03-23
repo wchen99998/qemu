@@ -77,9 +77,17 @@ static void sdl_force_system_cursor_visible(void)
 {
     int attempts = 0;
 
+    /*
+     * CoreGraphics deprecated the visibility query without providing a direct
+     * replacement. Keep the legacy probe so we only balance the hide count as
+     * far as needed.
+     */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
     while (!CGCursorIsVisible() && attempts++ < 8) {
         CGDisplayShowCursor(CGMainDisplayID());
     }
+#pragma clang diagnostic pop
 }
 #endif
 
