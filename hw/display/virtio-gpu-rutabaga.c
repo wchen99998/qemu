@@ -2243,6 +2243,42 @@ static void virtio_gpu_rutabaga_realize(DeviceState *qdev, Error **errp)
     }
 }
 
+static void virtio_gpu_rutabaga_reset_bh(VirtIOGPU *gpudev)
+{
+    VirtIOGPURutabaga *vr = VIRTIO_GPU_RUTABAGA(gpudev);
+    VirtIOGPUBase *g = VIRTIO_GPU_BASE(gpudev);
+
+    /*
+     * Only tear down native surfaces on an actual guest reboot, not
+     * during the initial virtio device-negotiation reset.  We detect
+     * a real reboot by checking whether the guest had created any
+     * resources (the reslist is non-empty only after the guest ran).
+     */
+    if (QTAILQ_EMPTY(&gpudev->reslist)) {
+        return;
+    }
+
+    /*
+     * Tear down native surfaces before resources are destroyed.
+     * With wsi=vulkan-swapchain gfxstream presents directly via a Vulkan
+     * swapchain bound to the host window.  If we don't release it here the
+     * SDL display listener cannot render the placeholder surface and the
+     * window freezes on the last guest frame.
+     *
+     * This runs from the main-loop BH so window operations (which require
+     * dispatch to the main thread on macOS) won't deadlock against the BQL.
+     *
+     * The surfaces are re-created on the next ui_info update when the guest
+     * re-establishes the graphics pipeline after reboot.
+     */
+    for (int i = 0; i < g->conf.max_outputs; i++) {
+        if (vr->native_surface_active[i]) {
+            rutabaga_teardown_native_surface(vr->rutabaga, i);
+            vr->native_surface_active[i] = false;
+        }
+    }
+}
+
 static void virtio_gpu_rutabaga_unrealize(DeviceState *qdev)
 {
     VirtIOGPURutabaga *vr = VIRTIO_GPU_RUTABAGA(qdev);
@@ -2279,6 +2315,7 @@ static void virtio_gpu_rutabaga_class_init(ObjectClass *klass, const void *data)
     vgc->process_cmd = virtio_gpu_rutabaga_process_cmd;
     vgc->update_cursor_data = virtio_gpu_rutabaga_update_cursor;
     vgc->resource_destroy = virtio_gpu_rutabaga_resource_unref;
+    vgc->reset_bh = virtio_gpu_rutabaga_reset_bh;
     vdc->realize = virtio_gpu_rutabaga_realize;
     device_class_set_parent_unrealize(dc, virtio_gpu_rutabaga_unrealize,
                                       &virtio_gpu_rutabaga_parent_unrealize);

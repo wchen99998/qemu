@@ -1555,6 +1555,10 @@ static void virtio_gpu_reset_bh(void *opaque)
     Error *local_err = NULL;
     int i = 0;
 
+    if (vgc->reset_bh) {
+        vgc->reset_bh(g);
+    }
+
     QTAILQ_FOREACH_SAFE(res, &g->reslist, next, tmp) {
         resource_id = res->resource_id;
         vgc->resource_destroy(g, res, &local_err);

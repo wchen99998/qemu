@@ -237,6 +237,10 @@ struct VirtIOGPUClass {
     void (*resource_destroy)(VirtIOGPU *g,
                              struct virtio_gpu_simple_resource *res,
                              Error **errp);
+    /* Called from the main-loop BH during device reset, before resources
+     * are destroyed and surfaces replaced.  Safe for operations that
+     * require the main thread (e.g. window/display teardown). */
+    void (*reset_bh)(VirtIOGPU *g);
 };
 
 /* VirtIOGPUGL renderer states */

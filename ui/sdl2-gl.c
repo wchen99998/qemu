@@ -245,6 +245,14 @@ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
         return;
     }
     if (!scon->guest_fb.framebuffer) {
+        /*
+         * No guest framebuffer (e.g. after virtio-gpu reset during a guest
+         * reboot).  Fall back to rendering the placeholder surface so the
+         * window stays responsive instead of freezing on the last frame.
+         */
+        if (scon->surface) {
+            sdl2_gl_render_surface(scon);
+        }
         return;
     }
 
