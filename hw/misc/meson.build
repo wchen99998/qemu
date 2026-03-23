@@ -161,3 +161,7 @@ system_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa_ec.c'))
 
 # HPPA devices
 system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))
+
+# Goldfish pipe (requires rutabaga for gfxstream service ops)
+system_ss.add(when: rutabaga,
+              if_true: [files('goldfish_pipe.c'), rutabaga])

@@ -36,6 +36,10 @@
 #include "qemu/log.h"
 #include "qemu-main.h"
 
+#ifdef CONFIG_DARWIN
+#include <ApplicationServices/ApplicationServices.h>
+#endif
+
 static int sdl2_num_outputs;
 static struct sdl2_console *sdl2_console;
 
@@ -67,6 +71,17 @@ static Notifier mouse_mode_notifier;
 #endif
 
 static void sdl_update_caption(struct sdl2_console *scon);
+
+#ifdef CONFIG_DARWIN
+static void sdl_force_system_cursor_visible(void)
+{
+    int attempts = 0;
+
+    while (!CGCursorIsVisible() && attempts++ < 8) {
+        CGDisplayShowCursor(CGMainDisplayID());
+    }
+}
+#endif
 
 #ifdef CONFIG_OPENGL
 static void sdl2_guest_size(struct sdl2_console *scon, int *width, int *height)
@@ -158,6 +173,129 @@ static void sdl2_fit_to_screen(struct sdl2_console *scon,
     }
 }
 
+static bool sdl2_guest_content_rect(struct sdl2_console *scon, SDL_Rect *rect)
+{
+    int guest_width, guest_height;
+    int window_width, window_height;
+    int content_width, content_height;
+    int content_x = 0, content_y = 0;
+
+    if (!scon->real_window) {
+        return false;
+    }
+
+    sdl2_guest_size(scon, &guest_width, &guest_height);
+    SDL_GetWindowSize(scon->real_window, &window_width, &window_height);
+
+    if (guest_width <= 0 || guest_height <= 0 ||
+        window_width <= 0 || window_height <= 0) {
+        return false;
+    }
+
+    if ((int64_t)window_width * guest_height >
+        (int64_t)window_height * guest_width) {
+        content_height = window_height;
+        content_width = (int)((int64_t)window_height * guest_width / guest_height);
+        content_x = (window_width - content_width) / 2;
+    } else {
+        content_width = window_width;
+        content_height = (int)((int64_t)window_width * guest_height / guest_width);
+        content_y = (window_height - content_height) / 2;
+    }
+
+    if (content_width <= 0 || content_height <= 0) {
+        return false;
+    }
+
+    rect->x = content_x;
+    rect->y = content_y;
+    rect->w = content_width;
+    rect->h = content_height;
+    return true;
+}
+
+#ifdef CONFIG_DARWIN
+static bool sdl2_set_window_size_if_needed(struct sdl2_console *scon,
+                                           int width, int height)
+{
+    int current_width, current_height;
+
+    if (!scon->real_window) {
+        return false;
+    }
+
+    SDL_GetWindowSize(scon->real_window, &current_width, &current_height);
+    if (abs(current_width - width) <= 1 &&
+        abs(current_height - height) <= 1) {
+        return false;
+    }
+
+    scon->auto_resize_in_flight = true;
+    SDL_SetWindowSize(scon->real_window, width, height);
+    return true;
+}
+
+static void sdl2_schedule_auto_resize(struct sdl2_console *scon)
+{
+    if (!scon->auto_resize_enabled || !scon->real_window || !scon->surface) {
+        return;
+    }
+
+    scon->auto_resize_pending = true;
+}
+
+static bool sdl2_maybe_finish_auto_resize(struct sdl2_console *scon)
+{
+    int guest_width, guest_height;
+    int window_width, window_height;
+    int target_width, target_height;
+
+    if (!scon->auto_resize_enabled || !scon->auto_resize_pending) {
+        return false;
+    }
+    scon->auto_resize_pending = false;
+
+    if (!scon->real_window || !scon->surface) {
+        return false;
+    }
+
+    sdl2_guest_size(scon, &guest_width, &guest_height);
+    SDL_GetWindowSize(scon->real_window, &window_width, &window_height);
+
+    if (guest_width <= 0 || guest_height <= 0 ||
+        window_width <= 0 || window_height <= 0) {
+        return false;
+    }
+
+    target_width = window_width;
+    target_height = window_height;
+    if ((int64_t)window_width * guest_height >
+        (int64_t)window_height * guest_width) {
+        target_width = (int)((int64_t)window_height * guest_width / guest_height);
+    } else if ((int64_t)window_width * guest_height <
+               (int64_t)window_height * guest_width) {
+        target_height = (int)((int64_t)window_width * guest_height / guest_width);
+    }
+
+    if (target_width <= 0 || target_height <= 0) {
+        return false;
+    }
+
+    return sdl2_set_window_size_if_needed(scon, target_width, target_height);
+}
+#else
+static void sdl2_schedule_auto_resize(struct sdl2_console *scon)
+{
+    (void)scon;
+}
+
+static bool sdl2_maybe_finish_auto_resize(struct sdl2_console *scon)
+{
+    (void)scon;
+    return false;
+}
+#endif
+
 #ifdef CONFIG_OPENGL
 static SDL_GLContext sdl2_window_create_gl_context(struct sdl2_console *scon,
                                                    DisplayGLMode mode)
@@ -191,6 +329,7 @@ static void sdl2_update_native_surface(struct sdl2_console *scon)
 {
 #ifdef __APPLE__
     QemuConsole *con = scon->dcl.con;
+    bool requested_auto_resize = false;
 
     if (!scon->real_window) {
         qemu_console_set_native_surface(con, NULL, 0, 0, 0, 0, 1.0f);
@@ -202,6 +341,15 @@ static void sdl2_update_native_surface(struct sdl2_console *scon)
     float dpr = 1.0f;
 
     SDL_VERSION(&wmInfo.version);
+
+    if (scon->auto_resize_enabled && !scon->auto_resize_ready && scon->surface) {
+        sdl2_schedule_auto_resize(scon);
+    }
+    requested_auto_resize = sdl2_maybe_finish_auto_resize(scon);
+    if (requested_auto_resize && scon->auto_resize_ready) {
+        return;
+    }
+
     SDL_GetWindowSize(scon->real_window, &width_pt, &height_pt);
 
     if (scon->opengl) {
@@ -221,6 +369,7 @@ static void sdl2_update_native_surface(struct sdl2_console *scon)
                                         width_pt, height_pt,
                                         width_px, height_px,
                                         dpr);
+        scon->auto_resize_ready = true;
     } else {
         warn_report("sdl2: SDL_GetWindowWMInfo failed for native surface");
     }
@@ -297,6 +446,10 @@ void sdl2_window_create(struct sdl2_console *scon)
                                          SDL_WINDOWPOS_UNDEFINED,
                                          width, height,
                                          flags);
+    scon->auto_resize_enabled = true;
+    scon->auto_resize_in_flight = false;
+    scon->auto_resize_ready = false;
+    scon->auto_resize_pending = false;
     if (scon->opengl) {
         const char *driver = "opengl";
 
@@ -334,17 +487,22 @@ void sdl2_window_create(struct sdl2_console *scon)
         scon->real_renderer = SDL_CreateRenderer(scon->real_window, -1, 0);
     }
     sdl_update_caption(scon);
-    sdl2_update_native_surface(scon);
+    if (scon->surface && !surface_is_placeholder(scon->surface)) {
+        sdl2_schedule_auto_resize(scon);
+    }
+    if (!sdl2_maybe_finish_auto_resize(scon)) {
+        sdl2_update_native_surface(scon);
 
-    /* Seed initial geometry so sdl2_update_refresh_rate can merge refresh_rate */
-    if (dpy_ui_info_supported(scon->dcl.con)) {
-        int win_w, win_h;
-        SDL_GetWindowSize(scon->real_window, &win_w, &win_h);
-        if (win_w > 0 && win_h > 0) {
-            QemuUIInfo info = *dpy_get_ui_info(scon->dcl.con);
-            info.width = win_w;
-            info.height = win_h;
-            dpy_set_ui_info(scon->dcl.con, &info, true);
+        /* Seed initial geometry so sdl2_update_refresh_rate can merge refresh_rate */
+        if (dpy_ui_info_supported(scon->dcl.con)) {
+            int win_w, win_h;
+            SDL_GetWindowSize(scon->real_window, &win_w, &win_h);
+            if (win_w > 0 && win_h > 0) {
+                QemuUIInfo info = *dpy_get_ui_info(scon->dcl.con);
+                info.width = win_w;
+                info.height = win_h;
+                dpy_set_ui_info(scon->dcl.con, &info, true);
+            }
         }
     }
     sdl2_update_refresh_rate(scon);
@@ -368,6 +526,10 @@ void sdl2_window_destroy(struct sdl2_console *scon)
     }
     SDL_DestroyWindow(scon->real_window);
     scon->real_window = NULL;
+    scon->auto_resize_enabled = false;
+    scon->auto_resize_in_flight = false;
+    scon->auto_resize_ready = false;
+    scon->auto_resize_pending = false;
 }
 
 void sdl2_window_resize(struct sdl2_console *scon)
@@ -380,7 +542,12 @@ void sdl2_window_resize(struct sdl2_console *scon)
     sdl2_guest_size(scon, &width, &height);
     sdl2_fit_to_screen(scon, &width, &height);
 
-    SDL_SetWindowSize(scon->real_window, width, height);
+    if (!scon->auto_resize_enabled) {
+        return;
+    }
+
+    sdl2_set_window_size_if_needed(scon, width, height);
+    sdl2_schedule_auto_resize(scon);
 }
 
 static void sdl2_redraw(struct sdl2_console *scon)
@@ -440,6 +607,15 @@ static void sdl_hide_cursor(struct sdl2_console *scon)
         return;
     }
 
+    if (qemu_input_is_touchscreen(scon->dcl.con)) {
+        SDL_SetCursor(sdl_cursor_normal);
+        SDL_ShowCursor(SDL_ENABLE);
+#ifdef CONFIG_DARWIN
+        sdl_force_system_cursor_visible();
+#endif
+        return;
+    }
+
     SDL_ShowCursor(SDL_DISABLE);
     SDL_SetCursor(sdl_cursor_hidden);
 
@@ -451,6 +627,13 @@ static void sdl_hide_cursor(struct sdl2_console *scon)
 static void sdl_show_cursor(struct sdl2_console *scon)
 {
     if (scon->opts->has_show_cursor && scon->opts->show_cursor) {
+        return;
+    }
+
+    if (qemu_input_is_touchscreen(scon->dcl.con)) {
+        SDL_SetRelativeMouseMode(SDL_FALSE);
+        SDL_SetCursor(sdl_cursor_normal);
+        SDL_ShowCursor(SDL_ENABLE);
         return;
     }
 
@@ -466,6 +649,9 @@ static void sdl_show_cursor(struct sdl2_console *scon)
     }
 
     SDL_ShowCursor(SDL_ENABLE);
+#ifdef CONFIG_DARWIN
+    sdl_force_system_cursor_visible();
+#endif
 }
 
 static void sdl_grab_start(struct sdl2_console *scon)
@@ -473,6 +659,13 @@ static void sdl_grab_start(struct sdl2_console *scon)
     QemuConsole *con = scon ? scon->dcl.con : NULL;
 
     if (!con || !qemu_console_is_graphic(con)) {
+        return;
+    }
+    if (qemu_input_is_touchscreen(con)) {
+        SDL_SetWindowGrab(scon->real_window, SDL_FALSE);
+        gui_grab = 0;
+        sdl_show_cursor(scon);
+        sdl_update_caption(scon);
         return;
     }
     /*
@@ -508,6 +701,11 @@ static void absolute_mouse_grab(struct sdl2_console *scon)
 {
     int mouse_x, mouse_y;
     int scr_w, scr_h;
+
+    if (qemu_input_is_touchscreen(scon->dcl.con)) {
+        return;
+    }
+
     SDL_GetMouseState(&mouse_x, &mouse_y);
     SDL_GetWindowSize(scon->real_window, &scr_w, &scr_h);
     if (mouse_x > 0 && mouse_x < scr_w - 1 &&
@@ -542,9 +740,21 @@ static void sdl_send_mouse_event(struct sdl2_console *scon, int dx, int dy,
         [INPUT_BUTTON_SIDE]       = SDL_BUTTON(SDL_BUTTON_X1),
         [INPUT_BUTTON_EXTRA]      = SDL_BUTTON(SDL_BUTTON_X2)
     };
+    static uint32_t touch_bmap[INPUT_BUTTON__MAX] = {
+        [INPUT_BUTTON_TOUCH]      = SDL_BUTTON(SDL_BUTTON_LEFT),
+    };
     static uint32_t prev_state;
+    static uint32_t prev_touch_state;
 
-    if (prev_state != state) {
+    if (qemu_input_is_touchscreen(scon->dcl.con)) {
+        uint32_t touch_state = state & SDL_BUTTON(SDL_BUTTON_LEFT);
+
+        if (prev_touch_state != touch_state) {
+            qemu_input_update_buttons(scon->dcl.con, touch_bmap,
+                                      prev_touch_state, touch_state);
+            prev_touch_state = touch_state;
+        }
+    } else if (prev_state != state) {
         qemu_input_update_buttons(scon->dcl.con, bmap, prev_state, state);
         prev_state = state;
     }
@@ -724,8 +934,14 @@ static void handle_mousemotion(SDL_Event *ev)
     int max_x, max_y;
     struct sdl2_console *scon = get_scon_from_window(ev->motion.windowID);
     int scr_w, scr_h, surf_w, surf_h, x, y, dx, dy;
+    SDL_Rect content_rect;
 
     if (!scon || !qemu_console_is_graphic(scon->dcl.con)) {
+        return;
+    }
+
+    if (qemu_input_is_touchscreen(scon->dcl.con) &&
+        !(ev->motion.state & SDL_BUTTON(SDL_BUTTON_LEFT))) {
         return;
     }
 
@@ -745,10 +961,21 @@ static void handle_mousemotion(SDL_Event *ev)
         }
     }
     sdl2_guest_size(scon, &surf_w, &surf_h);
-    x = (int64_t)ev->motion.x * surf_w / scr_w;
-    y = (int64_t)ev->motion.y * surf_h / scr_h;
-    dx = (int64_t)ev->motion.xrel * surf_w / scr_w;
-    dy = (int64_t)ev->motion.yrel * surf_h / scr_h;
+    if (sdl2_guest_content_rect(scon, &content_rect)) {
+        int local_x = ev->motion.x - content_rect.x;
+        int local_y = ev->motion.y - content_rect.y;
+        local_x = MIN(MAX(local_x, 0), content_rect.w - 1);
+        local_y = MIN(MAX(local_y, 0), content_rect.h - 1);
+        x = (int64_t)local_x * surf_w / content_rect.w;
+        y = (int64_t)local_y * surf_h / content_rect.h;
+        dx = (int64_t)ev->motion.xrel * surf_w / content_rect.w;
+        dy = (int64_t)ev->motion.yrel * surf_h / content_rect.h;
+    } else {
+        x = (int64_t)ev->motion.x * surf_w / scr_w;
+        y = (int64_t)ev->motion.y * surf_h / scr_h;
+        dx = (int64_t)ev->motion.xrel * surf_w / scr_w;
+        dy = (int64_t)ev->motion.yrel * surf_h / scr_h;
+    }
     if (gui_grab || qemu_input_is_absolute(scon->dcl.con) || absolute_enabled) {
         sdl_send_mouse_event(scon, dx, dy, x, y, ev->motion.state);
     }
@@ -760,6 +987,7 @@ static void handle_mousebutton(SDL_Event *ev)
     SDL_MouseButtonEvent *bev;
     struct sdl2_console *scon = get_scon_from_window(ev->button.windowID);
     int scr_w, scr_h, guest_width, guest_height, x, y;
+    SDL_Rect content_rect;
 
     if (!scon || !qemu_console_is_graphic(scon->dcl.con)) {
         return;
@@ -768,8 +996,17 @@ static void handle_mousebutton(SDL_Event *ev)
     bev = &ev->button;
     SDL_GetWindowSize(scon->real_window, &scr_w, &scr_h);
     sdl2_guest_size(scon, &guest_width, &guest_height);
-    x = (int64_t)bev->x * guest_width / scr_w;
-    y = (int64_t)bev->y * guest_height / scr_h;
+    if (sdl2_guest_content_rect(scon, &content_rect)) {
+        if (bev->x < content_rect.x || bev->x >= content_rect.x + content_rect.w ||
+            bev->y < content_rect.y || bev->y >= content_rect.y + content_rect.h) {
+            return;
+        }
+        x = (int64_t)(bev->x - content_rect.x) * guest_width / content_rect.w;
+        y = (int64_t)(bev->y - content_rect.y) * guest_height / content_rect.h;
+    } else {
+        x = (int64_t)bev->x * guest_width / scr_w;
+        y = (int64_t)bev->y * guest_height / scr_h;
+    }
 
     if (!gui_grab && !qemu_input_is_absolute(scon->dcl.con)) {
         if (ev->type == SDL_MOUSEBUTTONUP && bev->button == SDL_BUTTON_LEFT) {
@@ -825,6 +1062,15 @@ static void handle_windowevent(SDL_Event *ev)
 
     switch (ev->window.event) {
     case SDL_WINDOWEVENT_RESIZED:
+        if (scon->auto_resize_in_flight) {
+            scon->auto_resize_in_flight = false;
+        } else if (scon->auto_resize_ready) {
+            scon->auto_resize_enabled = false;
+            scon->auto_resize_pending = false;
+        }
+        if (sdl2_maybe_finish_auto_resize(scon)) {
+            break;
+        }
         {
             QemuUIInfo info = *dpy_get_ui_info(scon->dcl.con);
             info.width = ev->window.data1;
@@ -963,8 +1209,24 @@ static void sdl_mouse_warp(DisplayChangeListener *dcl,
                            int x, int y, bool on)
 {
     struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
+    int guest_width, guest_height, win_w, win_h;
+    int warp_x = x, warp_y = y;
+    SDL_Rect content_rect;
 
     if (!qemu_console_is_graphic(scon->dcl.con)) {
+        return;
+    }
+
+    if (qemu_input_is_touchscreen(scon->dcl.con)) {
+        SDL_SetRelativeMouseMode(SDL_FALSE);
+        SDL_SetCursor(sdl_cursor_normal);
+        SDL_ShowCursor(SDL_ENABLE);
+#ifdef CONFIG_DARWIN
+        sdl_force_system_cursor_visible();
+#endif
+        guest_cursor = false;
+        guest_x = x;
+        guest_y = y;
         return;
     }
 
@@ -975,7 +1237,19 @@ static void sdl_mouse_warp(DisplayChangeListener *dcl,
         if (gui_grab || qemu_input_is_absolute(scon->dcl.con) || absolute_enabled) {
             SDL_SetCursor(guest_sprite);
             if (!qemu_input_is_absolute(scon->dcl.con) && !absolute_enabled) {
-                SDL_WarpMouseInWindow(scon->real_window, x, y);
+                sdl2_guest_size(scon, &guest_width, &guest_height);
+                SDL_GetWindowSize(scon->real_window, &win_w, &win_h);
+                if (guest_width > 0 && guest_height > 0 &&
+                    win_w > 0 && win_h > 0) {
+                    if (sdl2_guest_content_rect(scon, &content_rect)) {
+                        warp_x = content_rect.x + (int64_t)x * content_rect.w / guest_width;
+                        warp_y = content_rect.y + (int64_t)y * content_rect.h / guest_height;
+                    } else {
+                        warp_x = (int64_t)x * win_w / guest_width;
+                        warp_y = (int64_t)y * win_h / guest_height;
+                    }
+                }
+                SDL_WarpMouseInWindow(scon->real_window, warp_x, warp_y);
             }
         }
     } else if (gui_grab) {

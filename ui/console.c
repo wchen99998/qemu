@@ -71,6 +71,18 @@ static DisplayState *display_state;
 static QTAILQ_HEAD(, QemuConsole) consoles =
     QTAILQ_HEAD_INITIALIZER(consoles);
 
+static bool console_debug_scanout_trace_enabled(void)
+{
+    static int enabled = -1;
+
+    if (enabled == -1) {
+        const char *env = getenv("QEMU_RUTABAGA_TRACE_SCANOUT");
+        enabled = (env && env[0] && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+
+    return enabled;
+}
+
 static void dpy_refresh(DisplayState *s);
 static DisplayState *get_alloc_displaystate(void);
 static bool displaychangelistener_has_dmabuf(DisplayChangeListener *dcl);
@@ -212,6 +224,11 @@ void qemu_console_set_native_surface(QemuConsole *con, void *handle,
                                      int width_px, int height_px,
                                      float dpr)
 {
+    if (console_debug_scanout_trace_enabled()) {
+        error_report("%s: console=%d handle=%p pt=%dx%d px=%dx%d dpr=%.3f",
+                     __func__, qemu_console_get_index(con), handle,
+                     width_pt, height_pt, width_px, height_px, dpr);
+    }
     con->native_surface_handle = handle;
     con->native_surface_width_pt = width_pt;
     con->native_surface_height_pt = height_pt;
@@ -867,6 +884,16 @@ void dpy_gfx_replace_surface(QemuConsole *con,
         new_surface = qemu_create_placeholder_surface(width, height, placeholder_msg);
     }
 
+    if (console_debug_scanout_trace_enabled()) {
+        error_report("%s: console=%d old=%p new=%p requested=%p old_placeholder=%d "
+                     "new_placeholder=%d size=%dx%d",
+                     __func__, qemu_console_get_index(con),
+                     old_surface, new_surface, surface,
+                     old_surface ? surface_is_placeholder(old_surface) : 0,
+                     surface_is_placeholder(new_surface),
+                     surface_width(new_surface), surface_height(new_surface));
+    }
+
     assert(old_surface != new_surface);
 
     con->scanout.kind = SCANOUT_SURFACE;
@@ -1039,6 +1066,10 @@ void dpy_gl_scanout_disable(QemuConsole *con)
     DisplayState *s = con->ds;
     DisplayChangeListener *dcl;
 
+    if (console_debug_scanout_trace_enabled()) {
+        error_report("%s: console=%d old_kind=%d", __func__,
+                     qemu_console_get_index(con), con->scanout.kind);
+    }
     if (con->scanout.kind != SCANOUT_SURFACE) {
         con->scanout.kind = SCANOUT_NONE;
     }
@@ -1063,6 +1094,14 @@ void dpy_gl_scanout_texture(QemuConsole *con,
 {
     DisplayState *s = con->ds;
     DisplayChangeListener *dcl;
+
+    if (console_debug_scanout_trace_enabled()) {
+        error_report("%s: console=%d backing_id=%u backing=%ux%u "
+                     "rect=%ux%u+%u+%u y0_top=%d d3d=%p",
+                     __func__, qemu_console_get_index(con), backing_id,
+                     backing_width, backing_height, width, height, x, y,
+                     backing_y_0_top ? 1 : 0, d3d_tex2d);
+    }
 
     con->scanout.kind = SCANOUT_TEXTURE;
     con->scanout.texture = (ScanoutTexture) {
@@ -1157,6 +1196,12 @@ void dpy_gl_update(QemuConsole *con,
     DisplayChangeListener *dcl;
 
     assert(con->gl);
+
+    if (console_debug_scanout_trace_enabled()) {
+        error_report("%s: console=%d kind=%d rect=%ux%u+%u+%u",
+                     __func__, qemu_console_get_index(con), con->scanout.kind,
+                     w, h, x, y);
+    }
 
     graphic_hw_gl_block(con, true);
     QLIST_FOREACH(dcl, &s->listeners, next) {

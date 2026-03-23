@@ -20,3 +20,5 @@ system_ss.add(when: 'CONFIG_PCI_EXPRESS', if_true: files('pcie_port.c', 'pcie_ho
 system_ss.add_all(when: 'CONFIG_PCI', if_true: pci_ss)
 
 system_ss.add(when: 'CONFIG_PCI', if_false: files('pci-stub.c'))
+system_ss.add(when: ['CONFIG_PCI', rutabaga],
+              if_true: [files('goldfish_address_space.c'), rutabaga])

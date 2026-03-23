@@ -99,9 +99,11 @@ void sdl2_gl_switch(DisplayChangeListener *dcl,
     if (!scon->real_window) {
         sdl2_window_create(scon);
         scon->gls = qemu_gl_init_shader();
-    } else if (old_surface &&
-               ((surface_width(old_surface)  != surface_width(new_surface)) ||
-                (surface_height(old_surface) != surface_height(new_surface)))) {
+    } else if (!surface_is_placeholder(new_surface) &&
+               (!old_surface ||
+                surface_is_placeholder(old_surface) ||
+                surface_width(old_surface) != surface_width(new_surface) ||
+                surface_height(old_surface) != surface_height(new_surface))) {
         sdl2_window_resize(scon);
     }
 

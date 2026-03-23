@@ -2022,6 +2022,25 @@ static int hvf_handle_vmexit(CPUState *cpu, hv_vcpu_exit_t *exit)
         /* we got kicked, no exit to process */
         ret = -1;
         break;
+    case HV_EXIT_REASON_UNKNOWN:
+        /*
+         * Newer Hypervisor.framework SDKs expose HV_EXIT_REASON_UNKNOWN.
+         * In practice we still sometimes get a populated exception payload,
+         * so prefer routing that through the normal exception path instead of
+         * aborting the whole VM.
+         */
+        error_report("%s: unexpected HV_EXIT_REASON_UNKNOWN syndrome=0x%" PRIx64
+                     " va=0x%" PRIx64 " pa=0x%" PRIx64,
+                     __func__, exit->exception.syndrome,
+                     exit->exception.virtual_address,
+                     exit->exception.physical_address);
+        if (exit->exception.syndrome) {
+            hvf_sync_vtimer(cpu);
+            ret = hvf_handle_exception(cpu, &exit->exception);
+            break;
+        }
+        ret = -1;
+        break;
     default:
         g_assert_not_reached();
     }

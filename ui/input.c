@@ -467,6 +467,39 @@ bool qemu_input_is_absolute(QemuConsole *con)
     return (s != NULL) && (s->handler->mask & INPUT_EVENT_MASK_ABS);
 }
 
+bool qemu_input_is_touchscreen(QemuConsole *con)
+{
+    QemuInputHandlerState *s;
+
+    QTAILQ_FOREACH(s, &handlers, node) {
+        if (s->con == NULL || s->con != con) {
+            continue;
+        }
+        if (!(s->handler->mask & (INPUT_EVENT_MASK_REL | INPUT_EVENT_MASK_ABS))) {
+            continue;
+        }
+        if (s->handler->is_touchscreen != NULL &&
+            s->handler->is_touchscreen(s->dev)) {
+            return true;
+        }
+    }
+
+    QTAILQ_FOREACH(s, &handlers, node) {
+        if (s->con != NULL) {
+            continue;
+        }
+        if (!(s->handler->mask & (INPUT_EVENT_MASK_REL | INPUT_EVENT_MASK_ABS))) {
+            continue;
+        }
+        if (s->handler->is_touchscreen != NULL &&
+            s->handler->is_touchscreen(s->dev)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 int qemu_input_scale_axis(int value,
                           int min_in, int max_in,
                           int min_out, int max_out)

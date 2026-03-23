@@ -23,6 +23,10 @@
 
 /* ----------------------------------------------------------------- */
 
+static void virtio_mouse_realize(DeviceState *dev, Error **errp);
+static void virtio_tablet_realize(DeviceState *dev, Error **errp);
+static bool virtio_input_hid_is_touchscreen(DeviceState *dev);
+
 static const unsigned short keymap_button[INPUT_BUTTON__MAX] = {
     [INPUT_BUTTON_LEFT]              = BTN_LEFT,
     [INPUT_BUTTON_RIGHT]             = BTN_RIGHT,
@@ -76,6 +80,16 @@ static void virtio_input_extend_config(VirtIOInput *vinput,
     ext.subsel = subsel;
     ext.size   = bmax;
     virtio_input_add_config(vinput, &ext);
+}
+
+static void virtio_input_clear_config(VirtIOInput *vinput)
+{
+    VirtIOInputConfig *cfg, *next;
+
+    QTAILQ_FOREACH_SAFE(cfg, &vinput->cfg_list, node, next) {
+        QTAILQ_REMOVE(&vinput->cfg_list, cfg, node);
+        g_free(cfg);
+    }
 }
 
 static void virtio_input_handle_event(DeviceState *dev, QemuConsole *src,
@@ -386,22 +400,32 @@ static const Property virtio_mouse_properties[] = {
 static void virtio_mouse_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+    VirtIOInputClass *vic = VIRTIO_INPUT_CLASS(klass);
 
     device_class_set_props(dc, virtio_mouse_properties);
+    vic->realize = virtio_mouse_realize;
 }
 
 static void virtio_mouse_init(Object *obj)
 {
     VirtIOInputHID *vhid = VIRTIO_INPUT_HID(obj);
-    VirtIOInput *vinput = VIRTIO_INPUT(obj);
 
     vhid->handler = &virtio_mouse_handler;
+}
+
+static void virtio_mouse_realize(DeviceState *dev, Error **errp)
+{
+    VirtIOInputHID *vhid = VIRTIO_INPUT_HID(dev);
+    VirtIOInput *vinput = VIRTIO_INPUT(dev);
+
+    virtio_input_clear_config(vinput);
     virtio_input_init_config(vinput, vhid->wheel_axis
                              ? virtio_mouse_config_v2
                              : virtio_mouse_config_v1);
     virtio_input_extend_config(vinput, keymap_button,
                                ARRAY_SIZE(keymap_button),
                                VIRTIO_INPUT_CFG_EV_BITS, EV_KEY);
+    virtio_input_hid_realize(dev, errp);
 }
 
 static const TypeInfo virtio_mouse_info = {
@@ -419,6 +443,7 @@ static const QemuInputHandler virtio_tablet_handler = {
     .mask  = INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_ABS,
     .event = virtio_input_handle_event,
     .sync  = virtio_input_handle_sync,
+    .is_touchscreen = virtio_input_hid_is_touchscreen,
 };
 
 static struct virtio_input_config virtio_tablet_config_v1[] = {
@@ -504,28 +529,55 @@ static struct virtio_input_config virtio_tablet_config_v2[] = {
 };
 
 static const Property virtio_tablet_properties[] = {
+    DEFINE_PROP_BOOL("direct", VirtIOInputHID, direct, false),
     DEFINE_PROP_BOOL("wheel-axis", VirtIOInputHID, wheel_axis, true),
 };
 
 static void virtio_tablet_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+    VirtIOInputClass *vic = VIRTIO_INPUT_CLASS(klass);
 
     device_class_set_props(dc, virtio_tablet_properties);
+    vic->realize = virtio_tablet_realize;
 }
 
 static void virtio_tablet_init(Object *obj)
 {
     VirtIOInputHID *vhid = VIRTIO_INPUT_HID(obj);
-    VirtIOInput *vinput = VIRTIO_INPUT(obj);
 
     vhid->handler = &virtio_tablet_handler;
+}
+
+static void virtio_tablet_realize(DeviceState *dev, Error **errp)
+{
+    VirtIOInputHID *vhid = VIRTIO_INPUT_HID(dev);
+    VirtIOInput *vinput = VIRTIO_INPUT(dev);
+
+    virtio_input_clear_config(vinput);
     virtio_input_init_config(vinput, vhid->wheel_axis
                              ? virtio_tablet_config_v2
                              : virtio_tablet_config_v1);
+    if (vhid->direct) {
+        static const unsigned short abs_props[] = {
+            INPUT_PROP_DIRECT,
+        };
+
+        virtio_input_extend_config(vinput, abs_props,
+                                   ARRAY_SIZE(abs_props),
+                                   VIRTIO_INPUT_CFG_PROP_BITS, 0);
+    }
     virtio_input_extend_config(vinput, keymap_button,
                                ARRAY_SIZE(keymap_button),
                                VIRTIO_INPUT_CFG_EV_BITS, EV_KEY);
+    virtio_input_hid_realize(dev, errp);
+}
+
+static bool virtio_input_hid_is_touchscreen(DeviceState *dev)
+{
+    VirtIOInputHID *vhid = VIRTIO_INPUT_HID(dev);
+
+    return vhid->direct;
 }
 
 static const TypeInfo virtio_tablet_info = {

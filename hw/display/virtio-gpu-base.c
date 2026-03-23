@@ -240,6 +240,17 @@ virtio_gpu_base_device_realize(DeviceState *qdev,
     for (i = 0; i < g->conf.max_outputs; i++) {
         g->scanout[i].con =
             graphic_console_init(DEVICE(g), i, &virtio_gpu_ops, g);
+        /*
+         * Seed the console with the configured initial mode instead of the
+         * generic 640x480 placeholder. Native-surface backends may create the
+         * host window before the guest submits its first real scanout, so the
+         * initial console geometry needs to reflect the configured panel size.
+         */
+        if (g->req_state[i].width && g->req_state[i].height) {
+            qemu_console_resize(g->scanout[i].con,
+                                g->req_state[i].width,
+                                g->req_state[i].height);
+        }
     }
 
     return true;

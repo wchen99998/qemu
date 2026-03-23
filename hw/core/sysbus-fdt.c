@@ -35,6 +35,7 @@
 #include "hw/platform-bus.h"
 #include "hw/display/ramfb.h"
 #include "hw/uefi/var-service-api.h"
+#include "hw/acpi/goldfish_defs.h"
 #include "hw/arm/fdt.h"
 
 /*
@@ -123,6 +124,46 @@ static int no_fdt_node(SysBusDevice *sbdev, void *opaque)
     return 0;
 }
 
+/*
+ * add_goldfish_pipe_fdt_node - create a DT node for goldfish_pipe
+ *
+ * The guest kernel driver (drivers/platform/goldfish/goldfish_pipe.c)
+ * matches on compatible = "google,android-pipe" and requires a single
+ * MMIO region and a single IRQ (level-high SPI).
+ */
+static int add_goldfish_pipe_fdt_node(SysBusDevice *sbdev, void *opaque)
+{
+    PlatformBusFDTData *data = opaque;
+    PlatformBusDevice *pbus = data->pbus;
+    void *fdt = data->fdt;
+    const char *parent_node = data->pbus_node_name;
+    char *nodename;
+    uint64_t mmio_base;
+    int irqn;
+
+    mmio_base = platform_bus_get_mmio_addr(pbus, sbdev, 0);
+    irqn = platform_bus_get_irqn(pbus, sbdev, 0);
+
+    nodename = g_strdup_printf("%s/android-pipe@%" PRIx64,
+                               parent_node, mmio_base);
+    qemu_fdt_add_subnode(fdt, nodename);
+    qemu_fdt_setprop_string(fdt, nodename, "compatible",
+                            "google,android-pipe");
+    qemu_fdt_setprop_sized_cells(fdt, nodename, "reg",
+                                 1, mmio_base,
+                                 1, (uint64_t)GOLDFISH_PIPE_IOMEM_SIZE);
+
+    if (irqn >= 0) {
+        qemu_fdt_setprop_cells(fdt, nodename, "interrupts",
+                               GIC_FDT_IRQ_TYPE_SPI,
+                               irqn + data->irq_start,
+                               GIC_FDT_IRQ_FLAGS_LEVEL_HI);
+    }
+
+    g_free(nodename);
+    return 0;
+}
+
 /* Device type based matching */
 static bool type_match(SysBusDevice *sbdev, const BindingEntry *entry)
 {
@@ -140,6 +181,7 @@ static const BindingEntry bindings[] = {
     TYPE_BINDING(TYPE_ARM_SMMUV3, no_fdt_node),
     TYPE_BINDING(TYPE_RAMFB_DEVICE, no_fdt_node),
     TYPE_BINDING(TYPE_UEFI_VARS_SYSBUS, add_uefi_vars_node),
+    TYPE_BINDING("goldfish_pipe", add_goldfish_pipe_fdt_node),
     TYPE_BINDING("", NULL), /* last element */
 };
 
@@ -212,6 +254,25 @@ void platform_bus_add_all_fdt_nodes(void *fdt, const char *intc, hwaddr addr,
 
     /* Loop through all dynamic sysbus devices and create their node */
     foreach_dynamic_sysbus_device(add_fdt_node, &data);
+
+    /* Debug: dump FDT after dynamic sysbus nodes are added */
+    {
+        const char *dump_path = getenv("QEMU_DUMP_FDT_AFTER_SYSBUS");
+        if (dump_path) {
+            void *fdt_copy = g_malloc(fdt_totalsize(fdt));
+            memcpy(fdt_copy, fdt, fdt_totalsize(fdt));
+            fdt_pack(fdt_copy);
+            FILE *f = fopen(dump_path, "wb");
+            if (f) {
+                int packed_size = fdt_totalsize(fdt_copy);
+                fwrite(fdt_copy, 1, packed_size, f);
+                fclose(f);
+                fprintf(stderr, "goldfish_pipe: dumped packed FDT (%d bytes) to %s\n",
+                        packed_size, dump_path);
+            }
+            g_free(fdt_copy);
+        }
+    }
 
     g_free(node);
 }

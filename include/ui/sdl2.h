@@ -43,6 +43,10 @@ struct sdl2_console {
     int idle_counter;
     int refresh_interval_busy;
     int ignore_hotkeys;
+    bool auto_resize_enabled;
+    bool auto_resize_in_flight;
+    bool auto_resize_ready;
+    bool auto_resize_pending;
     bool gui_keysym;
     SDL_GLContext winctx;
     QKbdState *kbd;

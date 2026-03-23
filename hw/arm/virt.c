@@ -3302,6 +3302,7 @@ static void virt_machine_class_init(ObjectClass *oc, const void *data)
     machine_class_allow_dynamic_sysbus_dev(mc, TYPE_RAMFB_DEVICE);
     machine_class_allow_dynamic_sysbus_dev(mc, TYPE_UEFI_VARS_SYSBUS);
     machine_class_allow_dynamic_sysbus_dev(mc, TYPE_ARM_SMMUV3);
+    machine_class_allow_dynamic_sysbus_dev(mc, "goldfish_pipe");
 #ifdef CONFIG_TPM
     machine_class_allow_dynamic_sysbus_dev(mc, TYPE_TPM_TIS_SYSBUS);
 #endif

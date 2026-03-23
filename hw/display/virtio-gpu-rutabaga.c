@@ -4,16 +4,62 @@
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/iov.h"
+#include "qemu/rcu.h"
+#include "qemu/thread.h"
 #include "trace.h"
 #include "hw/virtio/virtio.h"
 #include "hw/virtio/virtio-gpu.h"
 #include "hw/virtio/virtio-gpu-bswap.h"
 #include "hw/virtio/virtio-gpu-pixman.h"
 #include "hw/virtio/virtio-iommu.h"
+#include "system/memory.h"
 #include "ui/rect.h"
 
 #include <glib/gmem.h>
 #include <rutabaga_gfx/rutabaga_gfx_ffi.h>
+
+#include "../../../gfxstream/host/address_space/include/gfxstream/host/address_space.h"
+
+/*
+ * gfxstream's render-utils callback headers are C++-only. QEMU only needs the
+ * ABI layout so it can pass opaque callback tables through rutabaga into the
+ * gfxstream backend.
+ */
+typedef void (*gfxstream_vm_map_user_memory_t)(uint64_t gpa, void *hva,
+                                               uint64_t size);
+typedef void (*gfxstream_vm_unmap_user_memory_t)(uint64_t gpa, uint64_t size);
+typedef void *(*gfxstream_vm_lookup_user_memory_t)(uint64_t gpa);
+typedef void (*gfxstream_vm_register_vulkan_instance_t)(uint64_t id,
+                                                        const char *name);
+typedef void (*gfxstream_vm_unregister_vulkan_instance_t)(uint64_t id);
+typedef void (*gfxstream_vm_set_skip_snapshot_save_t)(bool used);
+typedef void (*gfxstream_vm_set_skip_snapshot_save_reason_t)(uint32_t reason);
+typedef void (*gfxstream_vm_set_snapshot_uses_vulkan_t)(void);
+
+typedef struct gfxstream_vm_ops {
+    gfxstream_vm_map_user_memory_t map_user_memory;
+    gfxstream_vm_unmap_user_memory_t unmap_user_memory;
+    gfxstream_vm_unmap_user_memory_t unmap_user_memory_async;
+    gfxstream_vm_lookup_user_memory_t lookup_user_memory;
+    gfxstream_vm_register_vulkan_instance_t register_vulkan_instance;
+    gfxstream_vm_unregister_vulkan_instance_t unregister_vulkan_instance;
+    gfxstream_vm_set_skip_snapshot_save_t set_skip_snapshot_save;
+    gfxstream_vm_set_skip_snapshot_save_reason_t set_skip_snapshot_save_reason;
+    gfxstream_vm_set_snapshot_uses_vulkan_t set_snapshot_uses_vulkan;
+} gfxstream_vm_ops;
+
+typedef struct AddressSpaceHwFuncs {
+    int (*allocSharedHostRegion)(uint64_t page_aligned_size, uint64_t *offset);
+    int (*freeSharedHostRegion)(uint64_t offset);
+    int (*allocSharedHostRegionLocked)(uint64_t page_aligned_size,
+                                       uint64_t *offset);
+    int (*freeSharedHostRegionLocked)(uint64_t offset);
+    uint64_t (*getPhysAddrStart)(void);
+    uint64_t (*getPhysAddrStartLocked)(void);
+    uint32_t (*getGuestPageSize)(void);
+    int (*allocSharedHostRegionFixedLocked)(uint64_t page_aligned_size,
+                                            uint64_t offset);
+} AddressSpaceHwFuncs;
 
 #define CHECK(condition, cmd)                                                 \
     do {                                                                      \
@@ -29,6 +75,642 @@ struct rutabaga_aio_data {
     struct VirtIOGPURutabaga *vr;
     struct rutabaga_fence fence;
 };
+
+#define VIRTIO_GPU_RUTABAGA_ASG_PHYS_BASE UINT64_C(0x0101010100000000)
+
+struct rutabaga_asg_mapping {
+    bool used;
+    bool hostmem_mapped;
+    MemoryRegion mr;
+    uint64_t gpa;
+    uint64_t size;
+    void *hva;
+};
+
+struct rutabaga_asg_shared_region {
+    bool used;
+    uint64_t offset;
+    uint64_t size;
+};
+
+static QemuMutex s_rutabaga_asg_lock;
+static bool s_rutabaga_asg_lock_initialized;
+static VirtIOGPURutabaga *s_rutabaga_asg_owner;
+static struct address_space_allocator s_rutabaga_asg_region_allocator;
+static bool s_rutabaga_asg_region_allocator_initialized;
+static struct rutabaga_asg_mapping s_rutabaga_asg_mappings[MAX_SLOTS];
+static struct rutabaga_asg_shared_region s_rutabaga_asg_shared_regions[MAX_SLOTS];
+static DeviceUnrealize virtio_gpu_rutabaga_parent_unrealize;
+
+static bool rutabaga_debug_asg_trace_enabled(void);
+
+static void rutabaga_asg_noop_register_vulkan_instance(uint64_t id, const char *name)
+{
+    (void)id;
+    (void)name;
+}
+
+static void rutabaga_asg_noop_unregister_vulkan_instance(uint64_t id)
+{
+    (void)id;
+}
+
+static void rutabaga_asg_noop_set_skip_snapshot_save(bool used)
+{
+    (void)used;
+}
+
+static void rutabaga_asg_noop_set_skip_snapshot_save_reason(uint32_t reason)
+{
+    (void)reason;
+}
+
+static void rutabaga_asg_noop_set_snapshot_uses_vulkan(void)
+{
+}
+
+static void rutabaga_asg_ensure_lock(void)
+{
+    if (!s_rutabaga_asg_lock_initialized) {
+        qemu_mutex_init(&s_rutabaga_asg_lock);
+        s_rutabaga_asg_lock_initialized = true;
+    }
+}
+
+static struct rutabaga_asg_mapping *
+rutabaga_asg_find_mapping_exact_locked(uint64_t gpa)
+{
+    uint32_t slot;
+
+    for (slot = 0; slot < MAX_SLOTS; slot++) {
+        if (s_rutabaga_asg_mappings[slot].used &&
+            s_rutabaga_asg_mappings[slot].gpa == gpa) {
+            return &s_rutabaga_asg_mappings[slot];
+        }
+    }
+
+    return NULL;
+}
+
+static struct rutabaga_asg_mapping *
+rutabaga_asg_find_mapping_containing_locked(uint64_t gpa)
+{
+    uint32_t slot;
+
+    for (slot = 0; slot < MAX_SLOTS; slot++) {
+        struct rutabaga_asg_mapping *mapping = &s_rutabaga_asg_mappings[slot];
+        if (!mapping->used) {
+            continue;
+        }
+        if (mapping->gpa <= gpa && mapping->gpa + mapping->size > gpa) {
+            return mapping;
+        }
+    }
+
+    return NULL;
+}
+
+static struct rutabaga_asg_mapping *
+rutabaga_asg_find_free_mapping_locked(void)
+{
+    uint32_t slot;
+
+    for (slot = 0; slot < MAX_SLOTS; slot++) {
+        if (!s_rutabaga_asg_mappings[slot].used) {
+            return &s_rutabaga_asg_mappings[slot];
+        }
+    }
+
+    return NULL;
+}
+
+static struct rutabaga_asg_shared_region *
+rutabaga_asg_find_shared_region_by_offset_locked(uint64_t offset)
+{
+    uint32_t slot;
+
+    for (slot = 0; slot < MAX_SLOTS; slot++) {
+        if (s_rutabaga_asg_shared_regions[slot].used &&
+            s_rutabaga_asg_shared_regions[slot].offset == offset) {
+            return &s_rutabaga_asg_shared_regions[slot];
+        }
+    }
+
+    return NULL;
+}
+
+static struct rutabaga_asg_shared_region *
+rutabaga_asg_find_free_shared_region_locked(void)
+{
+    uint32_t slot;
+
+    for (slot = 0; slot < MAX_SLOTS; slot++) {
+        if (!s_rutabaga_asg_shared_regions[slot].used) {
+            return &s_rutabaga_asg_shared_regions[slot];
+        }
+    }
+
+    return NULL;
+}
+
+static bool rutabaga_asg_get_hostmem_offset_locked(uint64_t gpa,
+                                                   uint64_t size,
+                                                   uint64_t *offset)
+{
+    VirtIOGPUBase *vb;
+    uint64_t hostmem_size;
+
+    if (!s_rutabaga_asg_owner) {
+        return false;
+    }
+
+    vb = VIRTIO_GPU_BASE(s_rutabaga_asg_owner);
+    hostmem_size = vb->conf.hostmem;
+
+    if (gpa < VIRTIO_GPU_RUTABAGA_ASG_PHYS_BASE) {
+        return false;
+    }
+
+    *offset = gpa - VIRTIO_GPU_RUTABAGA_ASG_PHYS_BASE;
+    if (*offset > hostmem_size) {
+        return false;
+    }
+    if (size > hostmem_size - *offset) {
+        return false;
+    }
+
+    return true;
+}
+
+static void rutabaga_asg_reset_locked(void)
+{
+    uint32_t slot;
+
+    if (s_rutabaga_asg_owner) {
+        VirtIOGPUBase *vb = VIRTIO_GPU_BASE(s_rutabaga_asg_owner);
+
+        for (slot = 0; slot < MAX_SLOTS; slot++) {
+            struct rutabaga_asg_mapping *mapping = &s_rutabaga_asg_mappings[slot];
+            if (mapping->used && mapping->hostmem_mapped) {
+                memory_region_del_subregion(&vb->hostmem, &mapping->mr);
+                object_unparent(OBJECT(&mapping->mr));
+            }
+        }
+    }
+
+    memset(s_rutabaga_asg_mappings, 0, sizeof(s_rutabaga_asg_mappings));
+    memset(s_rutabaga_asg_shared_regions, 0, sizeof(s_rutabaga_asg_shared_regions));
+
+    if (s_rutabaga_asg_region_allocator_initialized) {
+        address_space_allocator_destroy_nocleanup(&s_rutabaga_asg_region_allocator);
+        s_rutabaga_asg_region_allocator_initialized = false;
+    }
+}
+
+static bool rutabaga_asg_owner_available(VirtIOGPURutabaga *vr)
+{
+    bool available;
+
+    rutabaga_asg_ensure_lock();
+    qemu_mutex_lock(&s_rutabaga_asg_lock);
+    available = !s_rutabaga_asg_owner || s_rutabaga_asg_owner == vr;
+    qemu_mutex_unlock(&s_rutabaga_asg_lock);
+
+    return available;
+}
+
+static void rutabaga_asg_set_owner(VirtIOGPURutabaga *vr)
+{
+    rutabaga_asg_ensure_lock();
+    qemu_mutex_lock(&s_rutabaga_asg_lock);
+
+    if (s_rutabaga_asg_owner && s_rutabaga_asg_owner != vr) {
+        qemu_mutex_unlock(&s_rutabaga_asg_lock);
+        error_report("%s: multiple virtio-gpu-rutabaga ASG owners are unsupported",
+                     __func__);
+        abort();
+    }
+
+    rutabaga_asg_reset_locked();
+    s_rutabaga_asg_owner = vr;
+
+    if (VIRTIO_GPU_BASE(vr)->conf.hostmem) {
+        address_space_allocator_init(&s_rutabaga_asg_region_allocator,
+                                     VIRTIO_GPU_BASE(vr)->conf.hostmem, 8);
+        s_rutabaga_asg_region_allocator_initialized = true;
+    }
+
+    if (rutabaga_debug_asg_trace_enabled()) {
+        error_report("%s: owner=%p hostmem=0x%" PRIx64 " allocator_init=%d",
+                     __func__, vr, VIRTIO_GPU_BASE(vr)->conf.hostmem,
+                     s_rutabaga_asg_region_allocator_initialized ? 1 : 0);
+    }
+
+    qemu_mutex_unlock(&s_rutabaga_asg_lock);
+}
+
+static void rutabaga_asg_clear_owner(VirtIOGPURutabaga *vr)
+{
+    rutabaga_asg_ensure_lock();
+    qemu_mutex_lock(&s_rutabaga_asg_lock);
+
+    if (s_rutabaga_asg_owner == vr) {
+        rutabaga_asg_reset_locked();
+        s_rutabaga_asg_owner = NULL;
+    }
+
+    qemu_mutex_unlock(&s_rutabaga_asg_lock);
+}
+
+static void rutabaga_asg_map_user_memory(uint64_t gpa, void *hva, uint64_t size)
+{
+    struct rutabaga_asg_mapping *mapping;
+    uint64_t offset = 0;
+    bool hostmem_mappable;
+
+    rutabaga_asg_ensure_lock();
+    qemu_mutex_lock(&s_rutabaga_asg_lock);
+
+    if (rutabaga_asg_find_mapping_exact_locked(gpa)) {
+        error_report("%s: duplicate GPA mapping 0x%" PRIx64, __func__, gpa);
+        goto out;
+    }
+
+    mapping = rutabaga_asg_find_free_mapping_locked();
+    if (!mapping) {
+        error_report("%s: out of ASG mapping slots", __func__);
+        goto out;
+    }
+
+    hostmem_mappable = rutabaga_asg_get_hostmem_offset_locked(gpa, size, &offset);
+
+    if (rutabaga_debug_asg_trace_enabled()) {
+        error_report("%s: gpa=0x%" PRIx64 " hva=%p size=0x%" PRIx64
+                     " hostmem_mappable=%d offset=0x%" PRIx64,
+                     __func__, gpa, hva, size, hostmem_mappable ? 1 : 0, offset);
+    }
+
+    mapping->used = true;
+    mapping->gpa = gpa;
+    mapping->size = size;
+    mapping->hva = hva;
+    mapping->hostmem_mapped = false;
+
+    if (hostmem_mappable) {
+        memory_region_init_ram_ptr(&mapping->mr, OBJECT(s_rutabaga_asg_owner), "asg", size, hva);
+        memory_region_add_subregion(&VIRTIO_GPU_BASE(s_rutabaga_asg_owner)->hostmem, offset,
+                                    &mapping->mr);
+        mapping->hostmem_mapped = true;
+    }
+
+out:
+    qemu_mutex_unlock(&s_rutabaga_asg_lock);
+}
+
+static void rutabaga_asg_unmap_user_memory(uint64_t gpa, uint64_t size)
+{
+    struct rutabaga_asg_mapping *mapping;
+
+    (void)size;
+
+    rutabaga_asg_ensure_lock();
+    qemu_mutex_lock(&s_rutabaga_asg_lock);
+
+    mapping = rutabaga_asg_find_mapping_exact_locked(gpa);
+    if (!mapping) {
+        if (rutabaga_debug_asg_trace_enabled()) {
+            error_report("%s: no mapping for gpa=0x%" PRIx64, __func__, gpa);
+        }
+        goto out;
+    }
+
+    if (rutabaga_debug_asg_trace_enabled()) {
+        error_report("%s: gpa=0x%" PRIx64 " size=0x%" PRIx64 " hva=%p hostmem=%d",
+                     __func__, mapping->gpa, mapping->size, mapping->hva,
+                     mapping->hostmem_mapped ? 1 : 0);
+    }
+
+    if (mapping->hostmem_mapped && s_rutabaga_asg_owner) {
+        memory_region_del_subregion(&VIRTIO_GPU_BASE(s_rutabaga_asg_owner)->hostmem, &mapping->mr);
+        object_unparent(OBJECT(&mapping->mr));
+    }
+
+    memset(mapping, 0, sizeof(*mapping));
+
+out:
+    qemu_mutex_unlock(&s_rutabaga_asg_lock);
+}
+
+static void *rutabaga_asg_lookup_user_memory(uint64_t gpa)
+{
+    struct rutabaga_asg_mapping *mapping;
+    void *result = NULL;
+    const char *source = "unmapped";
+
+    rutabaga_asg_ensure_lock();
+    qemu_mutex_lock(&s_rutabaga_asg_lock);
+
+    mapping = rutabaga_asg_find_mapping_containing_locked(gpa);
+    if (mapping) {
+        result = (char *)mapping->hva + (gpa - mapping->gpa);
+        source = "asg-map";
+    }
+
+    if (rutabaga_debug_asg_trace_enabled()) {
+        error_report("%s: gpa=0x%" PRIx64 " result=%p source=%s",
+                     __func__, gpa, result, source);
+    }
+
+    qemu_mutex_unlock(&s_rutabaga_asg_lock);
+
+    if (result) {
+        return result;
+    }
+
+    {
+        MemoryRegion *mr;
+        hwaddr xlat = 0;
+        hwaddr len = 1;
+        void *ram_ptr = NULL;
+
+        RCU_READ_LOCK_GUARD();
+
+        mr = address_space_translate(&address_space_memory, gpa, &xlat, &len,
+                                     false, MEMTXATTRS_UNSPECIFIED);
+        if (!mr || !len) {
+            return NULL;
+        }
+
+        /*
+         * Accept both ordinary RAM and ram-device regions such as the
+         * goldfish_address_space BAR created with memory_region_init_ram_device_ptr().
+         * Generic DMA helpers reject ram-device regions, but ASG needs the backing
+         * HVA so gfxstream can read the shared ring directly.
+         */
+        if (!memory_access_is_direct(mr, false, MEMTXATTRS_UNSPECIFIED) &&
+            !memory_region_is_ram_device(mr)) {
+            return NULL;
+        }
+
+        ram_ptr = memory_region_get_ram_ptr(mr);
+        if (!ram_ptr) {
+            return NULL;
+        }
+
+        result = (char *)ram_ptr + xlat;
+    }
+
+    if (rutabaga_debug_asg_trace_enabled()) {
+        error_report("%s: gpa=0x%" PRIx64 " result=%p source=guest-ram",
+                     __func__, gpa, result);
+    }
+
+    return result;
+}
+
+static int rutabaga_asg_alloc_shared_host_region_locked(uint64_t page_aligned_size,
+                                                        uint64_t *offset)
+{
+    uint64_t alloc_offset;
+    struct rutabaga_asg_shared_region *region;
+
+    if (!offset) {
+        if (rutabaga_debug_asg_trace_enabled()) {
+            error_report("%s: missing offset size=0x%" PRIx64, __func__, page_aligned_size);
+        }
+        return -EINVAL;
+    }
+    if (!s_rutabaga_asg_region_allocator_initialized) {
+        if (rutabaga_debug_asg_trace_enabled()) {
+            error_report("%s: allocator not initialized size=0x%" PRIx64,
+                         __func__, page_aligned_size);
+        }
+        return -ENODEV;
+    }
+
+    alloc_offset = address_space_allocator_allocate(&s_rutabaga_asg_region_allocator,
+                                                    page_aligned_size);
+    if (alloc_offset == ANDROID_EMU_ADDRESS_SPACE_BAD_OFFSET) {
+        if (rutabaga_debug_asg_trace_enabled()) {
+            error_report("%s: allocator exhausted size=0x%" PRIx64, __func__,
+                         page_aligned_size);
+        }
+        return -ENOMEM;
+    }
+
+    region = rutabaga_asg_find_free_shared_region_locked();
+    if (!region) {
+        address_space_allocator_deallocate(&s_rutabaga_asg_region_allocator, alloc_offset);
+        if (rutabaga_debug_asg_trace_enabled()) {
+            error_report("%s: no free region slot offset=0x%" PRIx64 " size=0x%" PRIx64,
+                         __func__, alloc_offset, page_aligned_size);
+        }
+        return -ENOSPC;
+    }
+
+    region->used = true;
+    region->offset = alloc_offset;
+    region->size = page_aligned_size;
+    *offset = alloc_offset;
+    if (rutabaga_debug_asg_trace_enabled()) {
+        error_report("%s: size=0x%" PRIx64 " -> offset=0x%" PRIx64,
+                     __func__, page_aligned_size, alloc_offset);
+    }
+    return 0;
+}
+
+static int rutabaga_asg_alloc_shared_host_region(uint64_t page_aligned_size,
+                                                 uint64_t *offset)
+{
+    int ret;
+
+    rutabaga_asg_ensure_lock();
+    qemu_mutex_lock(&s_rutabaga_asg_lock);
+    ret = rutabaga_asg_alloc_shared_host_region_locked(page_aligned_size, offset);
+    qemu_mutex_unlock(&s_rutabaga_asg_lock);
+    return ret;
+}
+
+static int rutabaga_asg_free_shared_host_region_locked(uint64_t offset)
+{
+    struct rutabaga_asg_shared_region *region;
+    int ret;
+
+    if (!s_rutabaga_asg_region_allocator_initialized) {
+        if (rutabaga_debug_asg_trace_enabled()) {
+            error_report("%s: allocator not initialized offset=0x%" PRIx64, __func__, offset);
+        }
+        return -ENODEV;
+    }
+
+    region = rutabaga_asg_find_shared_region_by_offset_locked(offset);
+    if (!region) {
+        if (rutabaga_debug_asg_trace_enabled()) {
+            error_report("%s: missing region offset=0x%" PRIx64, __func__, offset);
+        }
+        return -EINVAL;
+    }
+
+    ret = address_space_allocator_deallocate(&s_rutabaga_asg_region_allocator, offset);
+    if (ret) {
+        if (rutabaga_debug_asg_trace_enabled()) {
+            error_report("%s: deallocate failed offset=0x%" PRIx64 " ret=%d",
+                         __func__, offset, ret);
+        }
+        return -ret;
+    }
+
+    memset(region, 0, sizeof(*region));
+    if (rutabaga_debug_asg_trace_enabled()) {
+        error_report("%s: freed offset=0x%" PRIx64, __func__, offset);
+    }
+    return 0;
+}
+
+static int rutabaga_asg_free_shared_host_region(uint64_t offset)
+{
+    int ret;
+
+    rutabaga_asg_ensure_lock();
+    qemu_mutex_lock(&s_rutabaga_asg_lock);
+    ret = rutabaga_asg_free_shared_host_region_locked(offset);
+    qemu_mutex_unlock(&s_rutabaga_asg_lock);
+    return ret;
+}
+
+static int rutabaga_asg_alloc_shared_host_region_fixed_locked(uint64_t page_aligned_size,
+                                                              uint64_t offset)
+{
+    struct rutabaga_asg_shared_region *region;
+    int ret;
+
+    if (!s_rutabaga_asg_region_allocator_initialized) {
+        if (rutabaga_debug_asg_trace_enabled()) {
+            error_report("%s: allocator not initialized size=0x%" PRIx64
+                         " offset=0x%" PRIx64,
+                         __func__, page_aligned_size, offset);
+        }
+        return -ENODEV;
+    }
+
+    region = rutabaga_asg_find_shared_region_by_offset_locked(offset);
+    if (region) {
+        if (rutabaga_debug_asg_trace_enabled()) {
+            error_report("%s: existing region offset=0x%" PRIx64 " size=0x%" PRIx64
+                         " requested=0x%" PRIx64,
+                         __func__, offset, region->size, page_aligned_size);
+        }
+        return region->size == page_aligned_size ? 0 : -EEXIST;
+    }
+
+    ret = address_space_allocator_allocate_fixed(&s_rutabaga_asg_region_allocator,
+                                                 page_aligned_size, offset);
+    if (ret) {
+        if (rutabaga_debug_asg_trace_enabled()) {
+            error_report("%s: allocate_fixed failed offset=0x%" PRIx64
+                         " size=0x%" PRIx64 " ret=%d",
+                         __func__, offset, page_aligned_size, ret);
+        }
+        return -ENOMEM;
+    }
+
+    region = rutabaga_asg_find_free_shared_region_locked();
+    if (!region) {
+        address_space_allocator_deallocate(&s_rutabaga_asg_region_allocator, offset);
+        if (rutabaga_debug_asg_trace_enabled()) {
+            error_report("%s: no free region slot offset=0x%" PRIx64 " size=0x%" PRIx64,
+                         __func__, offset, page_aligned_size);
+        }
+        return -ENOSPC;
+    }
+
+    region->used = true;
+    region->offset = offset;
+    region->size = page_aligned_size;
+    if (rutabaga_debug_asg_trace_enabled()) {
+        error_report("%s: size=0x%" PRIx64 " fixed-offset=0x%" PRIx64,
+                     __func__, page_aligned_size, offset);
+    }
+    return 0;
+}
+
+static uint64_t rutabaga_asg_get_phys_addr_start(void)
+{
+    return VIRTIO_GPU_RUTABAGA_ASG_PHYS_BASE;
+}
+
+static uint64_t rutabaga_asg_get_phys_addr_start_locked(void)
+{
+    return VIRTIO_GPU_RUTABAGA_ASG_PHYS_BASE;
+}
+
+static uint32_t rutabaga_asg_get_guest_page_size(void)
+{
+#if defined(__APPLE__) && defined(__arm64__)
+    return 16384;
+#else
+    return 4096;
+#endif
+}
+
+static const gfxstream_vm_ops s_rutabaga_gfxstream_vm_ops = {
+    .map_user_memory = rutabaga_asg_map_user_memory,
+    .unmap_user_memory = rutabaga_asg_unmap_user_memory,
+    .unmap_user_memory_async = rutabaga_asg_unmap_user_memory,
+    .lookup_user_memory = rutabaga_asg_lookup_user_memory,
+    .register_vulkan_instance = rutabaga_asg_noop_register_vulkan_instance,
+    .unregister_vulkan_instance = rutabaga_asg_noop_unregister_vulkan_instance,
+    .set_skip_snapshot_save = rutabaga_asg_noop_set_skip_snapshot_save,
+    .set_skip_snapshot_save_reason = rutabaga_asg_noop_set_skip_snapshot_save_reason,
+    .set_snapshot_uses_vulkan = rutabaga_asg_noop_set_snapshot_uses_vulkan,
+};
+
+static const AddressSpaceHwFuncs s_rutabaga_address_space_hw_funcs = {
+    .allocSharedHostRegion = rutabaga_asg_alloc_shared_host_region,
+    .freeSharedHostRegion = rutabaga_asg_free_shared_host_region,
+    .allocSharedHostRegionLocked = rutabaga_asg_alloc_shared_host_region_locked,
+    .freeSharedHostRegionLocked = rutabaga_asg_free_shared_host_region_locked,
+    .getPhysAddrStart = rutabaga_asg_get_phys_addr_start,
+    .getPhysAddrStartLocked = rutabaga_asg_get_phys_addr_start_locked,
+    .getGuestPageSize = rutabaga_asg_get_guest_page_size,
+    .allocSharedHostRegionFixedLocked = rutabaga_asg_alloc_shared_host_region_fixed_locked,
+};
+
+static bool rutabaga_debug_context_trace_enabled(void)
+{
+    static int enabled = -1;
+
+    if (enabled == -1) {
+        const char *env = g_getenv("QEMU_RUTABAGA_TRACE_CONTEXT");
+        enabled = (env && env[0] && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+
+    return enabled;
+}
+
+static bool rutabaga_debug_scanout_trace_enabled(void)
+{
+    static int enabled = -1;
+
+    if (enabled == -1) {
+        const char *env = g_getenv("QEMU_RUTABAGA_TRACE_SCANOUT");
+        enabled = (env && env[0] && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+
+    return enabled;
+}
+
+static bool rutabaga_debug_asg_trace_enabled(void)
+{
+    static int enabled = -1;
+
+    if (enabled == -1) {
+        const char *env = g_getenv("QEMU_RUTABAGA_TRACE_ASG");
+        enabled = (env && env[0] && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+
+    return enabled;
+}
 
 static int rutabaga_find_mapping_slot(VirtIOGPURutabaga *vr, uint32_t resource_id)
 {
@@ -51,6 +733,7 @@ static void rutabaga_release_mapping_slot(VirtIOGPUBase *vb,
     MemoryRegion *mr = &vr->memory_regions[slot].mr;
 
     memory_region_del_subregion(&vb->hostmem, mr);
+    object_unparent(OBJECT(mr));
     vr->memory_regions[slot].resource_id = 0;
     vr->memory_regions[slot].used = 0;
 }
@@ -271,8 +954,19 @@ rutabaga_cmd_context_create(VirtIOGPU *g,
     trace_virtio_gpu_cmd_ctx_create(cc.hdr.ctx_id,
                                     cc.debug_name);
 
+    if (rutabaga_debug_context_trace_enabled()) {
+        info_report("rutabaga ctx-create id=%u context_init=0x%x capset=%u name=%.*s",
+                    cc.hdr.ctx_id, cc.context_init,
+                    cc.context_init & 0xffu,
+                    (int)cc.nlen, cc.debug_name);
+    }
+
     result = rutabaga_context_create(vr->rutabaga, cc.hdr.ctx_id,
                                      cc.context_init, cc.debug_name, cc.nlen);
+    if (rutabaga_debug_context_trace_enabled()) {
+        info_report("rutabaga ctx-create result=%d id=%u context_init=0x%x",
+                    result, cc.hdr.ctx_id, cc.context_init);
+    }
     CHECK(!result, cmd);
 }
 
@@ -302,9 +996,21 @@ static void rutabaga_sync_native_surface(VirtIOGPURutabaga *vr,
     bool has_surface = qemu_console_get_native_surface(
         con, &handle, &width_pt, &height_pt, &width_px, &height_px, &dpr);
 
+    if (rutabaga_debug_scanout_trace_enabled()) {
+        error_report("%s: scanout=%u has_surface=%d active=%d handle=%p "
+                     "pt=%dx%d px=%dx%d dpr=%.3f",
+                     __func__, scanout_id, has_surface ? 1 : 0,
+                     vr->native_surface_active[scanout_id] ? 1 : 0,
+                     handle, width_pt, height_pt, width_px, height_px, dpr);
+    }
+
     if (!has_surface && vr->native_surface_active[scanout_id]) {
         rutabaga_teardown_native_surface(vr->rutabaga, scanout_id);
         vr->native_surface_active[scanout_id] = false;
+        if (rutabaga_debug_scanout_trace_enabled()) {
+            error_report("%s: scanout=%u tore down native surface", __func__,
+                         scanout_id);
+        }
         return;
     }
 
@@ -312,6 +1018,10 @@ static void rutabaga_sync_native_surface(VirtIOGPURutabaga *vr,
         int ret = rutabaga_setup_native_surface(
             vr->rutabaga, scanout_id, handle,
             width_pt, height_pt, width_px, height_px, dpr);
+        if (rutabaga_debug_scanout_trace_enabled()) {
+            error_report("%s: scanout=%u setup_native_surface ret=%d", __func__,
+                         scanout_id, ret);
+        }
         if (ret == 0) {
             vr->native_surface_active[scanout_id] = true;
             vr->native_surface_width_pt[scanout_id] = width_pt;
@@ -332,6 +1042,10 @@ static void rutabaga_sync_native_surface(VirtIOGPURutabaga *vr,
             int ret = rutabaga_resize_native_surface(
                 vr->rutabaga, scanout_id,
                 width_pt, height_pt, width_px, height_px, dpr);
+            if (rutabaga_debug_scanout_trace_enabled()) {
+                error_report("%s: scanout=%u resize_native_surface ret=%d",
+                             __func__, scanout_id, ret);
+            }
             if (ret == 0) {
                 vr->native_surface_width_pt[scanout_id] = width_pt;
                 vr->native_surface_height_pt[scanout_id] = height_pt;
@@ -379,12 +1093,25 @@ rutabaga_cmd_resource_flush(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd)
                 rf.r.y + rf.r.height >= scanout->y) {
                 within_bounds = true;
 
+                if (rutabaga_debug_scanout_trace_enabled()) {
+                    error_report("%s: blob flush resource=%u scanout=%d "
+                                 "rect=%ux%u+%u+%u console_gl=%d",
+                                 __func__, rf.resource_id, i,
+                                 rf.r.width, rf.r.height, rf.r.x, rf.r.y,
+                                 console_has_gl(scanout->con) ? 1 : 0);
+                }
+
                 rutabaga_sync_native_surface(vr, i, scanout->con);
 
                 {
                     int present_ret = rutabaga_present_flushed_resource(
                         vr->rutabaga, rf.resource_id,
                         rf.r.x, rf.r.y, rf.r.width, rf.r.height);
+                    if (rutabaga_debug_scanout_trace_enabled()) {
+                        error_report("%s: blob flush resource=%u scanout=%d "
+                                     "present_ret=%d",
+                                     __func__, rf.resource_id, i, present_ret);
+                    }
                     if (present_ret > 0) {
                         return;  /* native surface handled the present */
                     }
@@ -393,6 +1120,12 @@ rutabaga_cmd_resource_flush(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd)
                 if (console_has_gl(scanout->con)) {
                     dpy_gl_update(scanout->con, 0, 0, scanout->width,
                                   scanout->height);
+                    if (rutabaga_debug_scanout_trace_enabled()) {
+                        error_report("%s: blob flush resource=%u scanout=%d "
+                                     "submitted_gl_update size=%ux%u",
+                                     __func__, rf.resource_id, i,
+                                     scanout->width, scanout->height);
+                    }
                     update_submitted = true;
                 }
             }
@@ -472,6 +1205,12 @@ rutabaga_cmd_set_scanout(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd)
     trace_virtio_gpu_cmd_set_scanout(ss.scanout_id, ss.resource_id,
                                      ss.r.width, ss.r.height, ss.r.x, ss.r.y);
 
+    if (rutabaga_debug_scanout_trace_enabled()) {
+        error_report("%s: scanout=%u resource=%u rect=%ux%u+%u+%u",
+                     __func__, ss.scanout_id, ss.resource_id,
+                     ss.r.width, ss.r.height, ss.r.x, ss.r.y);
+    }
+
     if (ss.scanout_id >= g->parent_obj.conf.max_outputs) {
         cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID;
         return;
@@ -515,6 +1254,12 @@ rutabaga_cmd_set_scanout(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd)
     virtio_gpu_update_scanout(g, ss.scanout_id, res, &fb, &ss.r);
     rutabaga_set_scanout_resource(vr->rutabaga, ss.scanout_id,
                                   ss.resource_id, fb.width, fb.height);
+    if (rutabaga_debug_scanout_trace_enabled()) {
+        error_report("%s: scanout=%u installed surface=%p fb=%ux%u stride=%u "
+                     "resource_blob=%d",
+                     __func__, ss.scanout_id, scanout->ds,
+                     fb.width, fb.height, fb.stride, res->blob ? 1 : 0);
+    }
 }
 
 static void
@@ -538,6 +1283,14 @@ rutabaga_cmd_set_scanout_blob(VirtIOGPU *g,
     trace_virtio_gpu_cmd_set_scanout_blob(ss.scanout_id, ss.resource_id,
                                           ss.r.width, ss.r.height, ss.r.x,
                                           ss.r.y);
+
+    if (rutabaga_debug_scanout_trace_enabled()) {
+        error_report("%s: scanout=%u resource=%u rect=%ux%u+%u+%u "
+                     "scanout_blob=%ux%u format=0x%x",
+                     __func__, ss.scanout_id, ss.resource_id,
+                     ss.r.width, ss.r.height, ss.r.x, ss.r.y,
+                     ss.width, ss.height, ss.format);
+    }
 
     if (ss.scanout_id >= g->parent_obj.conf.max_outputs) {
         cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID;
@@ -580,6 +1333,12 @@ rutabaga_cmd_set_scanout_blob(VirtIOGPU *g,
     rutabaga_set_scanout_resource(vr->rutabaga, ss.scanout_id,
                                   ss.resource_id, ss.width, ss.height);
     rutabaga_sync_native_surface(vr, ss.scanout_id, scanout->con);
+    if (rutabaga_debug_scanout_trace_enabled()) {
+        error_report("%s: scanout=%u installed blob surface=%p fb=%ux%u "
+                     "stride=%u offset=%u",
+                     __func__, ss.scanout_id, scanout->ds,
+                     fb.width, fb.height, fb.stride, fb.offset);
+    }
 }
 
 static void
@@ -796,6 +1555,13 @@ rutabaga_cmd_get_capset_info(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd)
     result = rutabaga_get_capset_info(vr->rutabaga, info.capset_index,
                                       &resp.capset_id, &resp.capset_max_version,
                                       &resp.capset_max_size);
+
+    if (rutabaga_debug_context_trace_enabled()) {
+        info_report("rutabaga get-capset-info index=%u result=%d capset_id=%u version=%u size=%u",
+                    info.capset_index, result, resp.capset_id,
+                    resp.capset_max_version, resp.capset_max_size);
+    }
+
     CHECK(!result, cmd);
 
     resp.hdr.type = VIRTIO_GPU_RESP_OK_CAPSET_INFO;
@@ -814,6 +1580,10 @@ rutabaga_cmd_get_capset(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd)
     VirtIOGPURutabaga *vr = VIRTIO_GPU_RUTABAGA(g);
 
     VIRTIO_GPU_FILL_CMD(gc);
+    if (rutabaga_debug_context_trace_enabled()) {
+        info_report("rutabaga get-capset id=%u version=%u",
+                    gc.capset_id, gc.capset_version);
+    }
     for (i = 0; i < vr->num_capsets; i++) {
         result = rutabaga_get_capset_info(vr->rutabaga, i,
                                           &current_id, &capset_version,
@@ -829,8 +1599,13 @@ rutabaga_cmd_get_capset(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd)
 
     resp = g_malloc0(sizeof(*resp) + capset_size);
     resp->hdr.type = VIRTIO_GPU_RESP_OK_CAPSET;
-    rutabaga_get_capset(vr->rutabaga, gc.capset_id, gc.capset_version,
-                        resp->capset_data, capset_size);
+    result = rutabaga_get_capset(vr->rutabaga, gc.capset_id, gc.capset_version,
+                                 resp->capset_data, capset_size);
+    if (rutabaga_debug_context_trace_enabled()) {
+        info_report("rutabaga get-capset result=%d id=%u version=%u size=%u",
+                    result, gc.capset_id, gc.capset_version, capset_size);
+    }
+    CHECK(!result, cmd);
 
     virtio_gpu_ctrl_response(g, cmd, &resp->hdr, sizeof(*resp) + capset_size);
     g_free(resp);
@@ -934,6 +1709,13 @@ rutabaga_cmd_resource_map_blob(VirtIOGPU *g,
 
     result = rutabaga_resource_map(vr->rutabaga, mblob.resource_id, &mapping);
     CHECK(!result, cmd);
+
+    if (rutabaga_debug_asg_trace_enabled()) {
+        error_report("ASG-TRACE MAP_BLOB resource=%u hva=%p size=0x%" PRIx64
+                     " offset=0x%" PRIx64,
+                     mblob.resource_id, mapping.ptr,
+                     (uint64_t)mapping.size, mblob.offset);
+    }
 
     /*
      * There is small risk of the MemoryRegion dereferencing the pointer after
@@ -1187,6 +1969,8 @@ static void
 virtio_gpu_rutabaga_debug_cb(uint64_t user_data,
                              const struct rutabaga_debug *debug)
 {
+    (void)user_data;
+
     switch (debug->debug_type) {
     case RUTABAGA_DEBUG_ERROR:
         error_report("%s", debug->message);
@@ -1244,6 +2028,10 @@ static bool virtio_gpu_rutabaga_init(VirtIOGPU *g, Error **errp)
     builder.debug_cb = virtio_gpu_rutabaga_debug_cb;
     builder.capset_mask = vr->capset_mask;
     builder.user_data = (uint64_t)g;
+    builder.display_width = g->parent_obj.conf.xres;
+    builder.display_height = g->parent_obj.conf.yres;
+    builder.display_width_mm = g->parent_obj.conf.width_mm;
+    builder.display_height_mm = g->parent_obj.conf.height_mm;
 
     /*
      * If the user doesn't specify the wayland socket path, we try to infer
@@ -1287,6 +2075,8 @@ static bool virtio_gpu_rutabaga_init(VirtIOGPU *g, Error **errp)
     } else if (env_renderer_features && env_renderer_features[0]) {
         builder.renderer_features = env_renderer_features;
     }
+    builder.gfxstream_vm_ops = &s_rutabaga_gfxstream_vm_ops;
+    builder.address_space_hw_funcs = &s_rutabaga_address_space_hw_funcs;
 
     result = rutabaga_init(&builder, &vr->rutabaga);
     if (result) {
@@ -1376,6 +2166,17 @@ static void virtio_gpu_rutabaga_ui_info(void *opaque, uint32_t idx,
         g->req_state[idx].refresh_rate = info->refresh_rate;
     }
 
+    /*
+     * gfxstream's native-swapchain path can present directly into the host
+     * window once it has a native surface handle. On Android/gfxstream
+     * workloads the guest may never issue the legacy SET_SCANOUT /
+     * RESOURCE_FLUSH sequence that normally drives this sync point, so wire
+     * it to ui_info updates as well.
+     */
+    if (vr->rutabaga && g->scanout[idx].con) {
+        rutabaga_sync_native_surface(vr, idx, g->scanout[idx].con);
+    }
+
     if (refresh_changed) {
         g->virtio_config.events_read |= VIRTIO_GPU_EVENT_DISPLAY;
         virtio_notify_config(&g->parent_obj);
@@ -1387,11 +2188,18 @@ static void virtio_gpu_rutabaga_realize(DeviceState *qdev, Error **errp)
     int num_capsets;
     VirtIOGPUBase *bdev = VIRTIO_GPU_BASE(qdev);
     VirtIOGPU *gpudev = VIRTIO_GPU(qdev);
+    VirtIOGPURutabaga *vr = VIRTIO_GPU_RUTABAGA(qdev);
 
 #if HOST_BIG_ENDIAN
     error_setg(errp, "rutabaga is not supported on bigendian platforms");
     return;
 #endif
+
+    if (!rutabaga_asg_owner_available(vr)) {
+        error_setg(errp,
+                   "virtio-gpu-rutabaga ASG bridge supports only a single device instance");
+        return;
+    }
 
     if (!virtio_gpu_rutabaga_init(gpudev, errp)) {
         return;
@@ -1408,6 +2216,10 @@ static void virtio_gpu_rutabaga_realize(DeviceState *qdev, Error **errp)
 
     bdev->virtio_config.num_capsets = num_capsets;
     virtio_gpu_device_realize(qdev, errp);
+    if (errp && *errp) {
+        return;
+    }
+    rutabaga_asg_set_owner(vr);
 
     /*
      * Replace the base ui_info callback with a rutabaga-specific one
@@ -1429,6 +2241,14 @@ static void virtio_gpu_rutabaga_realize(DeviceState *qdev, Error **errp)
             }
         }
     }
+}
+
+static void virtio_gpu_rutabaga_unrealize(DeviceState *qdev)
+{
+    VirtIOGPURutabaga *vr = VIRTIO_GPU_RUTABAGA(qdev);
+
+    rutabaga_asg_clear_owner(vr);
+    virtio_gpu_rutabaga_parent_unrealize(qdev);
 }
 
 static const Property virtio_gpu_rutabaga_properties[] = {
@@ -1460,6 +2280,8 @@ static void virtio_gpu_rutabaga_class_init(ObjectClass *klass, const void *data)
     vgc->update_cursor_data = virtio_gpu_rutabaga_update_cursor;
     vgc->resource_destroy = virtio_gpu_rutabaga_resource_unref;
     vdc->realize = virtio_gpu_rutabaga_realize;
+    device_class_set_parent_unrealize(dc, virtio_gpu_rutabaga_unrealize,
+                                      &virtio_gpu_rutabaga_parent_unrealize);
     device_class_set_props(dc, virtio_gpu_rutabaga_properties);
 }
 

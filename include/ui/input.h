@@ -21,12 +21,14 @@ typedef struct QemuInputHandlerState QemuInputHandlerState;
 typedef void (*QemuInputHandlerEvent)(DeviceState *dev, QemuConsole *src,
                                       InputEvent *evt);
 typedef void (*QemuInputHandlerSync)(DeviceState *dev);
+typedef bool (*QemuInputHandlerIsTouchscreen)(DeviceState *dev);
 
 struct QemuInputHandler {
     const char             *name;
     uint32_t               mask;
     QemuInputHandlerEvent  event;
     QemuInputHandlerSync   sync;
+    QemuInputHandlerIsTouchscreen is_touchscreen;
 };
 
 QemuInputHandlerState *qemu_input_handler_register(DeviceState *dev,
@@ -58,6 +60,7 @@ void qemu_input_update_buttons(QemuConsole *src, uint32_t *button_map,
                                uint32_t button_old, uint32_t button_new);
 
 bool qemu_input_is_absolute(QemuConsole *con);
+bool qemu_input_is_touchscreen(QemuConsole *con);
 int qemu_input_scale_axis(int value,
                           int min_in, int max_in,
                           int min_out, int max_out);
